@@ -1,0 +1,18 @@
+# Local environments, generated binaries and private fixtures
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+build/
+dist/
+work/
+*.app/
+*.dmg
+*.zip
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+tests/private/

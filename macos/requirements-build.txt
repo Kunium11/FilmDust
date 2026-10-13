@@ -1,0 +1,7 @@
+numpy==2.0.2
+opencv-python==4.13.0.92
+Pillow==11.3.0
+tifffile==2024.8.30
+imagecodecs==2024.12.30
+pyinstaller==6.20.0
+pyinstaller-hooks-contrib==2026.8
