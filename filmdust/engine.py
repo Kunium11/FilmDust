@@ -574,25 +574,63 @@ def orient_array(a, orientation):
     return a
 
 
+# Strand branch-rejection only. These bounds limit thinning work; they are not
+# a recognition-accuracy threshold. opencv-python has no ximgproc.thinning, so
+# OpenCV applies the same Zhang-Suen deletion table the Python scan used.
+_THIN_MAX_SIDE = 1024
+_THIN_MAX_FOREGROUND = 20000
+_THIN_CANDIDATE_CAP = 2048
+_THIN_MAX_ITERS = 60
+# Bits follow the previous neighbor order: P2, P3, P4, P5, P6, P7, P8, P9.
+_THIN_KERNEL = np.array([[128, 1, 2], [64, 0, 4], [32, 16, 8]], np.float32)
+
+
+def _zhang_suen_luts():
+    luts = []
+    for step in (0, 1):
+        lut = np.zeros(256, np.uint8)
+        for code in range(256):
+            ns = [(code >> bit) & 1 for bit in range(8)]
+            neighbors = sum(ns)
+            transitions = sum((ns[i] == 0) and ns[(i + 1) % 8] == 1 for i in range(8))
+            if step == 0:
+                allowed = not (ns[0] and ns[2] and ns[4]) and not (ns[2] and ns[4] and ns[6])
+            else:
+                allowed = not (ns[0] and ns[2] and ns[6]) and not (ns[0] and ns[4] and ns[6])
+            lut[code] = 1 if 2 <= neighbors <= 6 and transitions == 1 and allowed else 0
+        luts.append(lut)
+    return luts
+
+
+_THIN_LUTS = _zhang_suen_luts()
+
+
 def _thin_skeleton(mask):
-    """Zhang-Suen thinning on a single small candidate, for branch rejection."""
-    a = np.pad(mask.astype(bool), 1)
-    for _ in range(60):
+    """OpenCV thinning of one small candidate, for branch rejection.
+
+    Returns None when the candidate is over the side or foreground cap.
+    Callers must not treat that skip as a coherent strand.
+    """
+    source = np.ascontiguousarray((mask > 0).astype(np.uint8))
+    x, y, w, h = cv2.boundingRect(source)
+    if w == 0 or h == 0:
+        return np.zeros(source.shape, np.uint8)
+    if max(w, h) > _THIN_MAX_SIDE or cv2.countNonZero(source) > _THIN_MAX_FOREGROUND:
+        return None
+    img = source[y:y + h, x:x + w].copy()
+    for _ in range(_THIN_MAX_ITERS):
         changed = False
-        for step in (0, 1):
-            p = a[1:-1, 1:-1]
-            ns = [a[:-2, 1:-1], a[:-2, 2:], a[1:-1, 2:], a[2:, 2:],
-                  a[2:, 1:-1], a[2:, :-2], a[1:-1, :-2], a[:-2, :-2]]
-            neighbors = sum(v.astype(np.uint8) for v in ns)
-            transitions = sum((~ns[i] & ns[(i + 1) % 8]).astype(np.uint8) for i in range(8))
-            constraint = (~(ns[0] & ns[2] & ns[4]) & ~(ns[2] & ns[4] & ns[6])) if step == 0 else (~(ns[0] & ns[2] & ns[6]) & ~(ns[0] & ns[4] & ns[6]))
-            remove = p & (neighbors >= 2) & (neighbors <= 6) & (transitions == 1) & constraint
-            if remove.any():
-                p[remove] = False
+        for lut in _THIN_LUTS:
+            code = cv2.filter2D(img, cv2.CV_8U, _THIN_KERNEL, borderType=cv2.BORDER_CONSTANT)
+            remove = cv2.bitwise_and(cv2.LUT(code, lut), img)
+            if cv2.countNonZero(remove):
+                img = cv2.subtract(img, remove)
                 changed = True
         if not changed:
             break
-    return a[1:-1, 1:-1].astype(np.uint8)
+    out = np.zeros(source.shape, np.uint8)
+    out[y:y + h, x:x + w] = img
+    return out
 
 
 def _frame_exclusion(gray):
@@ -698,8 +736,9 @@ def detect_dust(rgb, sensitivity=50, size=30, hairs=True, protect=True, polarity
     np.maximum.at(peaks, labels.ravel(), scores.ravel())
     keep = np.zeros(n, np.uint8)
     centers = np.zeros(gray.shape, np.float32)
+    hair_queue = []
     for k in range(1, n):
-        x, y, w, h, area = stats[k]
+        x, y, w, h, area = [int(v) for v in stats[k]]
         if peaks[k] < 1.6 or area < 8 or area > size * size * 8:
             continue
         local = (labels[y:y + h, x:x + w] == k).astype(np.uint8)
@@ -711,19 +750,30 @@ def detect_dust(rgb, sensitivity=50, size=30, hairs=True, protect=True, polarity
         if length <= size * 2 and density > .1 and area < size * size * 2 and (hairs or max(w, h) / max(1, min(w, h)) < 3.8):
             keep[k] = 255
         elif hairs and length <= min(1000, size * 30) and area / length < 18 and radius < 9:
-            yy, xx = np.nonzero(local)
-            points = np.column_stack((xx, yy)).astype(np.float32)
-            vx, vy, xm, ym = cv2.fitLine(points, cv2.DIST_L2, 0, .01, .01).ravel()
-            bend = np.mean(np.abs((xx - xm) * vy - (yy - ym) * vx))
-            skeleton = _thin_skeleton(local)
-            neighbors = cv2.filter2D(skeleton, -1, np.ones((3, 3), np.uint8)) - skeleton
-            endpoints = np.count_nonzero((neighbors == 1) & (skeleton > 0))
-            branches = ((neighbors > 2) & (skeleton > 0)).astype(np.uint8)
-            nbranches = cv2.connectedComponents(branches, 8)[0] - 1
-            coherent = endpoints <= 6 and (nbranches <= 4 or (endpoints <= 4 and mean_score > 1.6))
-            if coherent and (length < 65 or bend > 1.5):
-                keep[k] = 255
+            hair_queue.append((mean_score, k, length, x, y, w, h))
         if keep[k]:
+            cx, cy = centroids[k]
+            centers[int(cy), int(cx)] = 1
+    # Cap is a work bound. Past it, extra elongated components are not strand-kept.
+    if len(hair_queue) > _THIN_CANDIDATE_CAP:
+        hair_queue.sort(key=lambda item: item[0], reverse=True)
+        del hair_queue[_THIN_CANDIDATE_CAP:]
+    for mean_score, k, length, x, y, w, h in hair_queue:
+        local = (labels[y:y + h, x:x + w] == k).astype(np.uint8)
+        yy, xx = np.nonzero(local)
+        points = np.column_stack((xx, yy)).astype(np.float32)
+        vx, vy, xm, ym = cv2.fitLine(points, cv2.DIST_L2, 0, .01, .01).ravel()
+        bend = np.mean(np.abs((xx - xm) * vy - (yy - ym) * vx))
+        skeleton = _thin_skeleton(local)
+        if skeleton is None:
+            continue
+        neighbors = cv2.filter2D(skeleton, -1, np.ones((3, 3), np.uint8)) - skeleton
+        endpoints = np.count_nonzero((neighbors == 1) & (skeleton > 0))
+        branches = ((neighbors > 2) & (skeleton > 0)).astype(np.uint8)
+        nbranches = cv2.connectedComponents(branches, 8)[0] - 1
+        coherent = endpoints <= 6 and (nbranches <= 4 or (endpoints <= 4 and mean_score > 1.6))
+        if coherent and (length < 65 or bend > 1.5):
+            keep[k] = 255
             cx, cy = centroids[k]
             centers[int(cy), int(cx)] = 1
     crowd = cv2.boxFilter(centers, -1, (121, 121), normalize=False)
@@ -1003,37 +1053,54 @@ def heal_mask(original, mask, gray=False, report=None, manual=False):
     return result
 
 
+# Same halo the tile sweep used so inpaint still sees neighboring defects.
+_HEAL_MARGIN = 48
+_INPAINT_RADIUS = 4
+
+
+def _inpaint_ns(patch, local_mask, gray):
+    if patch.ndim == 2:
+        return cv2.inpaint(np.ascontiguousarray(patch), local_mask, _INPAINT_RADIUS, cv2.INPAINT_NS)
+    healed = np.array(patch, copy=True, order="C")
+    channels = 1 if gray else 3
+    for ch in range(channels):
+        healed[:, :, ch] = cv2.inpaint(np.ascontiguousarray(patch[:, :, ch]), local_mask, _INPAINT_RADIUS, cv2.INPAINT_NS)
+    return healed
+
+
 def _heal_local(original, mask, gray=False, enforce_limit=True):
-    """Heal only masked pixels at original depth; unchanged pixels are bit-exact."""
+    """Inpaint each connected mask component plus a margin.
+
+    Unselected pixels stay bit-exact. Other mask pixels inside the margin are
+    holes for this inpaint, so a neighboring defect is not used as source.
+    The image is not scanned on a fixed tile grid.
+    """
     result = original.copy()
     if not np.any(mask):
         return result
     height, width = mask.shape
-    selected_total = np.count_nonzero(mask)
+    binary = np.ascontiguousarray((mask > 0).astype(np.uint8))
+    selected_total = int(cv2.countNonZero(binary))
     if enforce_limit and selected_total / mask.size > .15:
         raise ValueError("选区超过照片的 15%，请先减少选区；此工具适合小灰尘和细丝。")
-    for y in range(0, height, 768):
-        for x in range(0, width, 768):
-            hh, ww = min(768, height - y), min(768, width - x)
-            central_mask = mask[y:y + hh, x:x + ww] > 0
-            if not central_mask.any():
-                continue
-            y0, y1 = max(0, y - 48), min(height, y + hh + 48)
-            x0, x1 = max(0, x - 48), min(width, x + ww + 48)
-            local_mask = mask[y0:y1, x0:x1]
-            patch = original[y0:y1, x0:x1]
-            # A surrounding 48px halo avoids seams where tiny defects cross tiles.
-            if original.ndim == 2:
-                healed = cv2.inpaint(patch, local_mask, 4, cv2.INPAINT_NS)
-            else:
-                healed = patch.copy()
-                channels = 1 if gray else 3
-                for ch in range(channels):
-                    healed[:, :, ch] = cv2.inpaint(np.ascontiguousarray(patch[:, :, ch]), local_mask, 4, cv2.INPAINT_NS)
-            sy, sx = y - y0, x - x0
-            target = result[y:y + hh, x:x + ww]
-            source = healed[sy:sy + hh, sx:sx + ww]
-            target[central_mask] = source[central_mask]
+    # Label only where the mask actually is. A corner mark must not build a
+    # full-frame label image, and this is not a tile inpaint sweep.
+    bx, by, bw, bh = cv2.boundingRect(binary)
+    sub = binary[by:by + bh, bx:bx + bw]
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(sub, 8)
+    for k in range(1, stats.shape[0]):
+        x, y, w, h, _ = (int(v) for v in stats[k])
+        if w == 0 or h == 0:
+            continue
+        ay, ax = by + y, bx + x
+        y0, y1 = max(0, ay - _HEAL_MARGIN), min(height, ay + h + _HEAL_MARGIN)
+        x0, x1 = max(0, ax - _HEAL_MARGIN), min(width, ax + w + _HEAL_MARGIN)
+        local_mask = np.ascontiguousarray(binary[y0:y1, x0:x1] * 255)
+        healed = _inpaint_ns(original[y0:y1, x0:x1], local_mask, gray)
+        component = labels[y:y + h, x:x + w] == k
+        target = result[ay:ay + h, ax:ax + w]
+        source = healed[ay - y0:ay - y0 + h, ax - x0:ax - x0 + w]
+        target[component] = source[component]
     return result
 
 
