@@ -9,7 +9,8 @@ import numpy as np
 import tifffile
 from PIL import Image, ImageCms
 
-from engine import Photo, detect_dust, heal_mask
+import engine
+from engine import Photo, detect_dust, detect_worker_count, heal_mask
 
 PRIVATE_SAMPLE = Path(os.environ.get("FILMDUST_PRIVATE_SAMPLE", str(Path(__file__).parent / "private/sample.jpeg")))
 PRIVATE_EDGE = Path(os.environ.get("FILMDUST_PRIVATE_EDGE", str(Path(__file__).parent / "private/edge-case.npz")))
@@ -197,6 +198,89 @@ class QualityChecks(unittest.TestCase):
         out = heal_mask(a, mask, report=report)
         self.assertTrue(report["pending"])
         np.testing.assert_array_equal(out[mask > 0], a[mask > 0])
+
+    def test_detect_worker_count_is_capped_and_can_force_serial(self):
+        saved = os.environ.get("FILMDUST_DETECT_WORKERS")
+        try:
+            os.environ.pop("FILMDUST_DETECT_WORKERS", None)
+            auto = detect_worker_count()
+            self.assertGreaterEqual(auto, 1)
+            self.assertLessEqual(auto, engine._DETECT_WORKER_CAP)
+            self.assertLessEqual(auto, os.cpu_count() or 1)
+            os.environ["FILMDUST_DETECT_WORKERS"] = "1"
+            self.assertEqual(detect_worker_count(), 1)
+            os.environ["FILMDUST_DETECT_WORKERS"] = "3"
+            self.assertEqual(detect_worker_count(), 3)
+            os.environ["FILMDUST_DETECT_WORKERS"] = "0"
+            with self.assertRaises(ValueError):
+                detect_worker_count()
+            os.environ["FILMDUST_DETECT_WORKERS"] = "many"
+            with self.assertRaises(ValueError):
+                detect_worker_count()
+        finally:
+            if saved is None:
+                os.environ.pop("FILMDUST_DETECT_WORKERS", None)
+            else:
+                os.environ["FILMDUST_DETECT_WORKERS"] = saved
+
+    def test_parallel_tiles_match_serial_mask(self):
+        """Multi-tile light and strong passes stay bit-identical when spread across cores."""
+        image = np.full((1100, 1300, 3), [70, 100, 130], np.uint8)
+        ys = np.linspace(-15, 25, image.shape[0], dtype=np.float32)
+        xs = np.linspace(-10, 18, image.shape[1], dtype=np.float32)
+        image = np.clip(image.astype(np.float32) + ys[:, None, None] + xs[None, :, None], 0, 255).astype(np.uint8)
+        # Specks sit inside tiles and on the 1024px boundaries the halo has to cover.
+        cv2.circle(image, (400, 300), 2, (250, 250, 250), -1)
+        cv2.circle(image, (1024, 480), 2, (255, 255, 255), -1)
+        cv2.circle(image, (700, 1024), 3, (248, 248, 248), -1)
+        cv2.circle(image, (1180, 200), 2, (252, 252, 252), -1)
+        curve = np.array([[x, 700 + int(12 * np.sin((x - 80) / 14.))] for x in range(80, 420)], np.int32)
+        cv2.polylines(image, [curve], False, (245, 245, 245), 1)
+        small = np.full((300, 400, 3), [72, 117, 150], np.uint8)
+        cv2.circle(small, (100, 100), 3, (245, 245, 245), -1)
+        saved = os.environ.get("FILMDUST_DETECT_WORKERS")
+        threads = cv2.getNumThreads()
+        seen = []
+        original_tile = engine._light_dust_tile
+
+        def spy(job, *args, **kwargs):
+            seen.append(cv2.getNumThreads())
+            return original_tile(job, *args, **kwargs)
+
+        engine._light_dust_tile = spy
+        try:
+            os.environ["FILMDUST_DETECT_WORKERS"] = "1"
+            serial_cap = {}
+            serial = detect_dust(image, 70, 30, True, True, "light", capture=serial_cap)
+            serial_small = detect_dust(small, 70, 30, True, True, "light")
+            self.assertEqual(cv2.getNumThreads(), threads)
+            self.assertGreaterEqual(len(seen), 4)
+            self.assertTrue(all(count == threads for count in seen))
+            seen.clear()
+            os.environ["FILMDUST_DETECT_WORKERS"] = "4"
+            parallel_cap = {}
+            parallel = detect_dust(image, 70, 30, True, True, "light", capture=parallel_cap)
+            pinned = list(seen)
+            parallel_small = detect_dust(small, 70, 30, True, True, "light")
+            self.assertEqual(cv2.getNumThreads(), threads)
+            self.assertGreaterEqual(len(pinned), 4)
+            self.assertTrue(all(count == 1 for count in pinned))
+            np.testing.assert_array_equal(parallel, serial)
+            np.testing.assert_array_equal(parallel_cap["scores"], serial_cap["scores"])
+            np.testing.assert_array_equal(parallel_cap["mask"], serial)
+            np.testing.assert_array_equal(parallel_small, serial_small)
+            self.assertGreater(np.count_nonzero(serial), 0)
+            os.environ.pop("FILMDUST_DETECT_WORKERS", None)
+            default = detect_dust(image, 70, 30, True, True, "light")
+            np.testing.assert_array_equal(default, serial)
+            self.assertEqual(cv2.getNumThreads(), threads)
+        finally:
+            engine._light_dust_tile = original_tile
+            if saved is None:
+                os.environ.pop("FILMDUST_DETECT_WORKERS", None)
+            else:
+                os.environ["FILMDUST_DETECT_WORKERS"] = saved
+            cv2.setNumThreads(threads)
 
 
 if __name__ == "__main__":

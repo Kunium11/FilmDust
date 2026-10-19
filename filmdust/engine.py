@@ -1,8 +1,10 @@
 """Local, mask-only film dust detection and healing. No model downloads."""
 import io
 import math
+import os
 import threading
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -14,6 +16,11 @@ from PIL import Image, ImageCms, ImageOps
 MAX_PIXELS = 100_000_000
 # Longest edge of the first comparison. Full-frame previews replace it later.
 QUICK_PREVIEW_EDGE = 2048
+# Median kernels in the detection tiles do not speed up when OpenCV adds
+# threads. Tiles run side by side instead. The automatic count follows this
+# machine and stays capped so each worker's float scratch does not grow with
+# every logical CPU. FILMDUST_DETECT_WORKERS=1 keeps the serial loop.
+_DETECT_WORKER_CAP = 8
 # Undo keeps changed rectangles, not another full frame. The cap is the
 # retained patch bytes; a step is never dropped if it is the only one.
 UNDO_BYTE_BUDGET = 256 * 1024 * 1024
@@ -906,12 +913,138 @@ def split_automatic_candidates(rgb, proposal, level="gentle", polarity="light"):
     return take[labels], hold[labels], dict(candidates=n - 1, selected=int(np.count_nonzero(take)), kept=int(np.count_nonzero(hold)))
 
 
-def detect_dust(rgb, sensitivity=50, size=30, hairs=True, protect=True, polarity="both"):
+def detect_worker_count():
+    """Workers for independent detection tiles. 1 forces the serial loop."""
+    raw = os.environ.get("FILMDUST_DETECT_WORKERS")
+    if raw is None or not raw.strip():
+        return max(1, min(os.cpu_count() or 1, _DETECT_WORKER_CAP))
+    try:
+        count = int(raw)
+    except ValueError:
+        raise ValueError("FILMDUST_DETECT_WORKERS 必须是正整数。") from None
+    if count < 1:
+        raise ValueError("FILMDUST_DETECT_WORKERS 必须是正整数。")
+    return count
+
+
+def _pin_opencv_one_thread():
+    """OpenCV's own pool does not speed these medians and would fight the workers."""
+    cv2.setNumThreads(1)
+
+
+def _run_tile_jobs(jobs, tile):
+    """Run tiles. A single tile, or FILMDUST_DETECT_WORKERS=1, stays on this thread."""
+    workers = detect_worker_count()
+    if workers <= 1 or len(jobs) <= 1:
+        for job in jobs:
+            tile(job)
+        return
+    previous = cv2.getNumThreads()
+    cv2.setNumThreads(1)
+    try:
+        with ThreadPoolExecutor(max_workers=min(workers, len(jobs)), initializer=_pin_opencv_one_thread) as pool:
+            list(pool.map(tile, jobs, chunksize=1))
+    finally:
+        cv2.setNumThreads(previous)
+
+
+def _tile_origins(height, width):
+    return [(y, x) for y in range(0, height, 1024) for x in range(0, width, 1024)]
+
+
+def _light_dust_tile(job, gray, extent, scores, scene, sensitivity, polarity):
+    """One light-dust block. The 96px halo is the serial neighborhood; only the inner block is written."""
+    y, x = job
+    height, width = gray.shape
+    y0, y1 = max(0, y - 96), min(height, y + 1120)
+    x0, x1 = max(0, x - 96), min(width, x + 1120)
+    patch = gray[y0:y1, x0:x1]
+    f = patch.astype(np.float32)
+    smooth = cv2.GaussianBlur(f, (0, 0), 1.4)
+    ref = cv2.GaussianBlur(cv2.medianBlur(patch, 31).astype(np.float32), (0, 0), 1.4)
+    delta = smooth - ref
+    residual = np.maximum(delta, 0) if polarity == "light" else np.maximum(-delta, 0) if polarity == "dark" else np.abs(delta)
+    noise = cv2.medianBlur(np.clip(np.abs(f - cv2.medianBlur(patch, 5)), 0, 255).astype(np.uint8), 9).astype(np.float32)
+    score = residual / (2 + (100 - sensitivity) * .02 + noise * .55)
+    bg = cv2.GaussianBlur(cv2.medianBlur(patch, 7).astype(np.float32), (0, 0), .8)
+    band = np.abs(bg - cv2.GaussianBlur(bg, (0, 0), 4))
+    detail = cv2.GaussianBlur(band, (0, 0), 15)
+    occupancy = cv2.boxFilter((band > 2).astype(np.float32), -1, (81, 81))
+    gradient = cv2.magnitude(cv2.Sobel(ref, cv2.CV_32F, 1, 0) / 8, cv2.Sobel(ref, cv2.CV_32F, 0, 1) / 8)
+    boundaries = cv2.dilate((gradient > 5).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    excluded = ((detail > 1) & (occupancy > .40)) | boundaries
+    sy, sx = y - y0, x - x0
+    hh, ww = min(1024, height - y), min(1024, width - x)
+    source = np.s_[sy:sy + hh, sx:sx + ww]
+    target = np.s_[y:y + hh, x:x + ww]
+    extent[target] = ((score > .70) & ~excluded)[source].astype(np.uint8) * 255
+    scores[target] = score[source]
+    scene[target] = excluded[source].astype(np.uint8)
+
+
+def _fill_light_dust_tiles(gray, extent, scores, scene, sensitivity, polarity):
+    jobs = _tile_origins(*gray.shape)
+
+    def tile(job):
+        _light_dust_tile(job, gray, extent, scores, scene, sensitivity, polarity)
+
+    _run_tile_jobs(jobs, tile)
+
+
+def _strong_dust_tile(job, gray, candidate, strength, sensitivity, polarity, threshold):
+    """One strong-dust block. Same 32px halo and inner write as the serial loop."""
+    y, x = job
+    height, width = gray.shape
+    y0, y1 = max(0, y - 32), min(height, y + 1056)
+    x0, x1 = max(0, x - 32), min(width, x + 1056)
+    patch = gray[y0:y1, x0:x1]
+    f = patch.astype(np.float32)
+    reference = cv2.medianBlur(patch, 21).astype(np.float32)
+    fine = cv2.medianBlur(patch, 5).astype(np.float32)
+    delta = f - reference
+    fine_delta = f - fine
+    residual = np.maximum(delta, 0) if polarity == "light" else np.maximum(-delta, 0) if polarity == "dark" else np.abs(delta)
+    # Median of residuals estimates local grain without reacting to isolated dust.
+    noise = cv2.medianBlur(np.clip(np.abs(fine_delta), 0, 255).astype(np.uint8), 9).astype(np.float32)
+    smooth = cv2.GaussianBlur(reference, (0, 0), 1.5)
+    gx = cv2.Sobel(smooth, cv2.CV_32F, 1, 0, ksize=3) / 8
+    gy = cv2.Sobel(smooth, cv2.CV_32F, 0, 1, ksize=3) / 8
+    edges = cv2.magnitude(gx, gy)
+    gate = threshold + noise * 3 + edges * 1.8
+    score = residual / np.maximum(gate, 1)
+    # Texture and scene boundaries are intentionally left for manual marks.
+    # The median reference suppresses dust itself so isolated specks do
+    # not disqualify their own otherwise smooth background.
+    background = cv2.medianBlur(patch, 7).astype(np.float32)
+    background = np.where(score > 1, reference, background)
+    mean = cv2.GaussianBlur(background, (0, 0), 7)
+    variance = cv2.GaussianBlur(background * background, (0, 0), 7) - mean * mean
+    texture = np.sqrt(np.maximum(variance, 0))
+    boundaries = cv2.dilate((edges > 2.5 + sensitivity * .055).astype(np.uint8), np.ones((7, 7), np.uint8))
+    marks = ((score > 1) & (texture < 4 + sensitivity * .08) & (boundaries == 0)).astype(np.uint8) * 255
+    sy, sx = y - y0, x - x0
+    hh, ww = min(1024, height - y), min(1024, width - x)
+    candidate[y:y + hh, x:x + ww] = marks[sy:sy + hh, sx:sx + ww]
+    strength[y:y + hh, x:x + ww] = score[sy:sy + hh, sx:sx + ww]
+
+
+def _fill_strong_dust_tiles(gray, candidate, strength, sensitivity, polarity, threshold):
+    jobs = _tile_origins(*gray.shape)
+
+    def tile(job):
+        _strong_dust_tile(job, gray, candidate, strength, sensitivity, polarity, threshold)
+
+    _run_tile_jobs(jobs, tile)
+
+
+def detect_dust(rgb, sensitivity=50, size=30, hairs=True, protect=True, polarity="both", *, capture=None):
     """Strong dust plus coherent faint defects; dense scene texture is protected.
 
     Do not erase candidate pixels before measuring background texture: doing so
     makes a tiled roof look flat. Texture occupancy over a wider neighborhood
     distinguishes repeating highlights from one isolated hair or dust blob.
+    Light-dust tiles (median kernel 31, 96px halo) and the strong-dust tiles
+    below run across cores. Each worker writes only its inner block.
     """
     sensitivity = float(np.clip(sensitivity, 1, 100))
     size = int(np.clip(size, 4, 100))
@@ -923,32 +1056,7 @@ def detect_dust(rgb, sensitivity=50, size=30, hairs=True, protect=True, polarity
     scores = np.zeros(gray.shape, np.float32)
     scene = np.zeros_like(gray)
     # 96px halo covers the wider texture neighborhood and avoids tile seams.
-    for y in range(0, height, 1024):
-        for x in range(0, width, 1024):
-            y0, y1 = max(0, y - 96), min(height, y + 1120)
-            x0, x1 = max(0, x - 96), min(width, x + 1120)
-            patch = gray[y0:y1, x0:x1]
-            f = patch.astype(np.float32)
-            smooth = cv2.GaussianBlur(f, (0, 0), 1.4)
-            ref = cv2.GaussianBlur(cv2.medianBlur(patch, 31).astype(np.float32), (0, 0), 1.4)
-            delta = smooth - ref
-            residual = np.maximum(delta, 0) if polarity == "light" else np.maximum(-delta, 0) if polarity == "dark" else np.abs(delta)
-            noise = cv2.medianBlur(np.clip(np.abs(f - cv2.medianBlur(patch, 5)), 0, 255).astype(np.uint8), 9).astype(np.float32)
-            score = residual / (2 + (100 - sensitivity) * .02 + noise * .55)
-            bg = cv2.GaussianBlur(cv2.medianBlur(patch, 7).astype(np.float32), (0, 0), .8)
-            band = np.abs(bg - cv2.GaussianBlur(bg, (0, 0), 4))
-            detail = cv2.GaussianBlur(band, (0, 0), 15)
-            occupancy = cv2.boxFilter((band > 2).astype(np.float32), -1, (81, 81))
-            gradient = cv2.magnitude(cv2.Sobel(ref, cv2.CV_32F, 1, 0) / 8, cv2.Sobel(ref, cv2.CV_32F, 0, 1) / 8)
-            boundaries = cv2.dilate((gradient > 5).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
-            excluded = ((detail > 1) & (occupancy > .40)) | boundaries
-            sy, sx = y - y0, x - x0
-            hh, ww = min(1024, height - y), min(1024, width - x)
-            source = np.s_[sy:sy + hh, sx:sx + ww]
-            target = np.s_[y:y + hh, x:x + ww]
-            extent[target] = ((score > .70) & ~excluded)[source].astype(np.uint8) * 255
-            scores[target] = score[source]
-            scene[target] = excluded[source].astype(np.uint8)
+    _fill_light_dust_tiles(gray, extent, scores, scene, sensitivity, polarity)
     if protect:
         scene |= _frame_exclusion(gray)
         extent[scene > 0] = 0
@@ -990,7 +1098,7 @@ def detect_dust(rgb, sensitivity=50, size=30, hairs=True, protect=True, polarity
     crowd = cv2.boxFilter(centers, -1, (121, 121), normalize=False)
     mask = keep[labels]
     mask[crowd > 7] = 0
-    strong = _detect_strong_dust(rgb, sensitivity, size, hairs, protect, polarity)
+    strong = _detect_strong_dust(rgb, sensitivity, size, hairs, protect, polarity, capture)
     strong[scene > 0] = 0
     mask = np.maximum(mask, strong)
     # Separate a bright, thicker speck attached to a thin line, without selecting
@@ -1018,10 +1126,13 @@ def detect_dust(rgb, sensitivity=50, size=30, hairs=True, protect=True, polarity
     mask = np.maximum(mask, cv2.dilate(ckeep[clabels], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))))
     mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
     mask[scene > 0] = 0
+    if capture is not None:
+        capture["scores"] = scores
+        capture["mask"] = mask
     return mask
 
 
-def _detect_strong_dust(rgb, sensitivity=50, size=30, hairs=False, protect=True, polarity="both"):
+def _detect_strong_dust(rgb, sensitivity=50, size=30, hairs=False, protect=True, polarity="both", capture=None):
     """Multiscale residuals with texture/edge penalties, native-resolution tiles."""
     sensitivity = float(np.clip(sensitivity, 1, 100))
     size = int(np.clip(size, 4, 100))
@@ -1033,39 +1144,8 @@ def _detect_strong_dust(rgb, sensitivity=50, size=30, hairs=False, protect=True,
     candidate = np.zeros_like(gray)
     strength = np.zeros_like(gray, dtype=np.float32)
     threshold = 5 + (100 - sensitivity) * .18
-    for y in range(0, height, 1024):
-        for x in range(0, width, 1024):
-            y0, y1 = max(0, y - 32), min(height, y + 1056)
-            x0, x1 = max(0, x - 32), min(width, x + 1056)
-            patch = gray[y0:y1, x0:x1]
-            f = patch.astype(np.float32)
-            reference = cv2.medianBlur(patch, 21).astype(np.float32)
-            fine = cv2.medianBlur(patch, 5).astype(np.float32)
-            delta = f - reference
-            fine_delta = f - fine
-            residual = np.maximum(delta, 0) if polarity == "light" else np.maximum(-delta, 0) if polarity == "dark" else np.abs(delta)
-            # Median of residuals estimates local grain without reacting to isolated dust.
-            noise = cv2.medianBlur(np.clip(np.abs(fine_delta), 0, 255).astype(np.uint8), 9).astype(np.float32)
-            smooth = cv2.GaussianBlur(reference, (0, 0), 1.5)
-            gx = cv2.Sobel(smooth, cv2.CV_32F, 1, 0, ksize=3) / 8
-            gy = cv2.Sobel(smooth, cv2.CV_32F, 0, 1, ksize=3) / 8
-            edges = cv2.magnitude(gx, gy)
-            gate = threshold + noise * 3 + edges * 1.8
-            score = residual / np.maximum(gate, 1)
-            # Texture and scene boundaries are intentionally left for manual marks.
-            # The median reference suppresses dust itself so isolated specks do
-            # not disqualify their own otherwise smooth background.
-            background = cv2.medianBlur(patch, 7).astype(np.float32)
-            background = np.where(score > 1, reference, background)
-            mean = cv2.GaussianBlur(background, (0, 0), 7)
-            variance = cv2.GaussianBlur(background * background, (0, 0), 7) - mean * mean
-            texture = np.sqrt(np.maximum(variance, 0))
-            boundaries = cv2.dilate((edges > 2.5 + sensitivity * .055).astype(np.uint8), np.ones((7, 7), np.uint8))
-            marks = ((score > 1) & (texture < 4 + sensitivity * .08) & (boundaries == 0)).astype(np.uint8) * 255
-            sy, sx = y - y0, x - x0
-            hh, ww = min(1024, height - y), min(1024, width - x)
-            candidate[y:y + hh, x:x + ww] = marks[sy:sy + hh, sx:sx + ww]
-            strength[y:y + hh, x:x + ww] = score[sy:sy + hh, sx:sx + ww]
+    # 32px halo is the serial neighborhood. Workers write disjoint 1024px blocks.
+    _fill_strong_dust_tiles(gray, candidate, strength, sensitivity, polarity, threshold)
     if protect:
         # Exclude dark film surround and the picture/frame seam, plus outer 1.5%.
         dark = (gray < 24).astype(np.uint8)
@@ -1099,6 +1179,9 @@ def _detect_strong_dust(rgb, sensitivity=50, size=30, hairs=False, protect=True,
     mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
     if protect:
         mask[excluded > 0] = 0
+    if capture is not None:
+        capture["strong_scores"] = strength
+        capture["strong_mask"] = mask
     return mask
 
 
