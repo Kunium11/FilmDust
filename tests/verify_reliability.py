@@ -167,13 +167,21 @@ class SessionChecks(unittest.TestCase):
         rect = ','.join(str(v) for v in (x,y,w,h))
         url = self.base + '/api/image?id=' + ident + '&kind=result&v=1&rect=' + rect
         with urllib.request.urlopen(url) as response:
-            preview = np.asarray(Image.open(io.BytesIO(response.read())))
+            body = response.read()
+            self.assertEqual(response.headers['Content-Type'], 'image/jpeg')
+        self.assertTrue(body.startswith(b'\xff\xd8'))
+        preview = np.asarray(Image.open(io.BytesIO(body)).convert('RGB'))
         exported = tifffile.imread(io.BytesIO(self.post('/api/export', {'id':ident,'revision':1})[1]))
-        np.testing.assert_array_equal(preview, exported[y:y+h,x:x+w])
+        photo = server.SESSIONS[ident]
+        np.testing.assert_array_equal(exported, photo.heal())
+        np.testing.assert_array_equal(exported[photo.mask == 0], photo.original[photo.mask == 0])
+        region = exported[y:y + h, x:x + w]
+        self.assertEqual(preview.shape, region.shape)
+        self.assertLess(float(np.mean(np.abs(preview.astype(np.int16) - region.astype(np.int16)))), 8)
         with self.assertRaises(urllib.error.HTTPError):
             urllib.request.urlopen(url.replace('&v=1', '&v=0'))
         with self.assertRaises(urllib.error.HTTPError):
-            urllib.request.urlopen(url.replace('&rect='+rect, '&rect=-1,0,10,10'))
+            urllib.request.urlopen(url.replace('&rect=' + rect, '&rect=-1,0,10,10'))
 
 
 if __name__ == '__main__':

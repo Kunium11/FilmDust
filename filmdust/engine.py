@@ -1,6 +1,7 @@
 """Local, mask-only film dust detection and healing. No model downloads."""
 import io
 import math
+import threading
 from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
@@ -11,6 +12,8 @@ import tifffile
 from PIL import Image, ImageCms, ImageOps
 
 MAX_PIXELS = 100_000_000
+# Longest edge of the first comparison. Full-frame previews replace it later.
+QUICK_PREVIEW_EDGE = 2048
 
 
 class Photo:
@@ -109,6 +112,66 @@ class Photo:
         self.preview = self.display(self.original)
         self.preview_patch = None
         self.edit_report = None
+        # Reads of the cached original preview must stay valid while detect runs.
+        # The cache is immutable after this point; detect only reads self.preview.
+        self.lock = threading.RLock()
+        self.quick_original = None
+        self.quick_original_is_full = False
+        self._cache_quick_original()
+
+    def _cache_quick_original(self):
+        """Lossy low-resolution original, ready before detection starts.
+
+        Large scans use the same downscale-then-display path as the quick result,
+        so the first comparison does not compare two different color pipelines.
+        """
+        if max(self.height, self.width) <= QUICK_PREVIEW_EDGE:
+            displayed = self.preview
+            self.quick_original_is_full = True
+        else:
+            displayed = self.display(downscale(self.original, QUICK_PREVIEW_EDGE))
+            self.quick_original_is_full = False
+        self.quick_original = lossy_preview_bytes(displayed)
+
+    def _quick_original_matches(self, max_edge):
+        if self.quick_original is None:
+            return False
+        if max_edge is None:
+            return self.quick_original_is_full
+        long_edge = max(self.height, self.width)
+        return max_edge == QUICK_PREVIEW_EDGE or (self.quick_original_is_full and max_edge >= long_edge)
+
+    def render_preview(self, kind, region, max_edge=None, full=True):
+        """Lossy bytes for /api/image. Does not change detection or heal pixels."""
+        detailed = not full
+        if kind == "original":
+            if full and self._quick_original_matches(max_edge):
+                return self.quick_original
+            pixels = self.preview[region]
+            if max_edge:
+                pixels = downscale(pixels, max_edge)
+            return lossy_preview_bytes(pixels, detailed=detailed)
+        if kind == "mask":
+            pixels = self.mask[region]
+            if max_edge:
+                pixels = downscale(pixels, max_edge)
+            return lossy_preview_bytes(pixels, detailed=detailed)
+        if kind == "overlay":
+            mask = self.mask[region]
+            pending = self.pending_mask[region]
+            if max_edge:
+                mask = downscale(mask, max_edge)
+                pending = downscale(pending, max_edge)
+            overlay = np.zeros((mask.shape[0], mask.shape[1], 4), np.uint8)
+            overlay[pending > 0] = [242, 195, 79, 180]
+            overlay[mask > 0] = [244, 91, 66, 155]
+            return lossy_preview_bytes(overlay, detailed=detailed)
+        if kind == "result":
+            pixels = self.heal()[region]
+            if max_edge:
+                pixels = downscale(pixels, max_edge)
+            return lossy_preview_bytes(self.display(pixels), detailed=detailed)
+        raise ValueError("未知预览类型。")
 
     @contextmanager
     def transaction(self):
@@ -1077,3 +1140,40 @@ def png_bytes(array):
     out = io.BytesIO()
     Image.fromarray(array).save(out, format="PNG", compress_level=2)
     return out.getvalue()
+
+
+def downscale(array, max_edge):
+    """Shrink so the long edge is at most max_edge. Area sampling keeps thin marks."""
+    height, width = array.shape[:2]
+    long_edge = max(height, width)
+    if not max_edge or long_edge <= max_edge:
+        return array
+    scale = max_edge / long_edge
+    size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+    return cv2.resize(array, size, interpolation=cv2.INTER_AREA)
+
+
+def lossy_preview_bytes(array, detailed=False):
+    """Browser preview. Photographs are JPEG; alpha overlays are WebP.
+
+    Rect updates use a higher quality so a patched comparison does not smear.
+    Full-frame previews favor size and encode time. Neither path is an export.
+    """
+    array = np.ascontiguousarray(array)
+    quality = 93 if detailed else 80
+    if array.ndim == 3 and array.shape[2] == 4:
+        bgra = cv2.cvtColor(array, cv2.COLOR_RGBA2BGRA)
+        ok, encoded = cv2.imencode(".webp", bgra, [int(cv2.IMWRITE_WEBP_QUALITY), quality])
+        mime = "image/webp"
+    elif array.ndim == 2 or (array.ndim == 3 and array.shape[2] == 3):
+        source = cv2.cvtColor(array, cv2.COLOR_RGB2BGR) if array.ndim == 3 else array
+        sampling = cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444 if detailed else cv2.IMWRITE_JPEG_SAMPLING_FACTOR_420
+        ok, encoded = cv2.imencode(".jpg", source, [
+            int(cv2.IMWRITE_JPEG_QUALITY), quality,
+            int(cv2.IMWRITE_JPEG_SAMPLING_FACTOR), sampling])
+        mime = "image/jpeg"
+    else:
+        raise ValueError("无法编码此预览。")
+    if not ok:
+        raise ValueError("预览编码失败。")
+    return encoded.tobytes(), mime

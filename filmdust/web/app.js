@@ -1,6 +1,7 @@
 'use strict';
 const $=id=>document.getElementById(id), token=document.querySelector('meta[name="film-token"]').content;
-const state={id:null,info:null,original:null,result:null,mask:null,overlay:null,view:'compare',tool:'pan',scale:1,ox:0,oy:0,split:.5,busy:false,pointer:null,space:false,compareBefore:false,cloneSource:null,reviewIndex:0,reviewGroups:[],reviewPoint:null,ready:false,custom:false,lossyConfirmedFor:null,outdated:false,fitted:true,viewportW:0,viewportH:0,savedRevision:null,renderedRevision:null,pendingPreview:false,lastDuration:null,lastEditDuration:null};
+const state={id:null,info:null,original:null,result:null,mask:null,overlay:null,view:'compare',tool:'pan',scale:1,ox:0,oy:0,split:.5,busy:false,pointer:null,space:false,compareBefore:false,cloneSource:null,reviewIndex:0,reviewGroups:[],reviewPoint:null,ready:false,custom:false,lossyConfirmedFor:null,outdated:false,fitted:true,viewportW:0,viewportH:0,savedRevision:null,renderedRevision:null,pendingPreview:false,lastDuration:null,lastEditDuration:null,fullResolution:false,previewEpoch:0,sharpening:false};
+const quickEdge=2048;
 const stage=$('stage'),canvas=$('viewer'),ctx=canvas.getContext('2d');let toastTimer;
 function toast(message,error=false){$('toast').textContent=message;$('toast').classList.toggle('error',error);$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,error?8000:3500);}
 const defaults={sensitivity:70,size:30,polarity:'light',protect:true,hairs:true};
@@ -26,7 +27,9 @@ function interactive(){
 }
 let busyTimer,busyStarted;
 function busy(on,message='正在自动处理…',local=false){
- state.busy=on;$('busyOverlay').hidden=!on||local;$('busyText').textContent=message;$('editStatus').hidden=!on||!local;$('editStatus').textContent=message;
+ state.busy=on;$('busyOverlay').hidden=!on||local;$('busyText').textContent=message;
+ if(state.sharpening && !on){$('editStatus').hidden=false;$('editStatus').textContent='正在载入完整清晰度…';}
+ else{$('editStatus').hidden=!on||!local;if(on)$('editStatus').textContent=message;}
  clearInterval(busyTimer);
  if(on){busyStarted=performance.now();$('busyElapsed').textContent='照片留在本机处理';busyTimer=setInterval(()=>$('busyElapsed').textContent=`已用时 ${((performance.now()-busyStarted)/1000).toFixed(1)} 秒`,100);}
  interactive();
@@ -49,7 +52,14 @@ function afterPreviewDraw(){
   frame=requestAnimationFrame(()=>{frame=requestAnimationFrame(finish);});
  });
 }
-function imageURL(kind,info=state.info,id=state.id){return `/api/image?id=${encodeURIComponent(id)}&kind=${kind}&v=${info.revision}`;}
+function imageURL(kind,info=state.info,id=state.id,maxEdge=0){
+ let url=`/api/image?id=${encodeURIComponent(id)}&kind=${kind}&v=${info.revision}`;
+ if(maxEdge)url+=`&max=${maxEdge}`;
+ return url;
+}
+function progressive(info){return Math.max(info.width,info.height)>quickEdge;}
+function photoWidth(){return state.info?.width||state.original?.width||1;}
+function photoHeight(){return state.info?.height||state.original?.height||1;}
 function updateInfo(info){
  state.info=info;$('fileName').textContent=info.name;
  $('imageMeta').textContent=`${info.width.toLocaleString()} × ${info.height.toLocaleString()} · ${info.depth} 位 · ${info.profile}`;
@@ -74,11 +84,36 @@ function mutableImage(im){
  const surface=document.createElement('canvas');surface.width=im.width;surface.height=im.height;
  surface.getContext('2d').drawImage(im,0,0);return surface;
 }
+function showPhoto(info){
+ $('empty').hidden=true;canvas.hidden=false;
+ for(const id of ['workspaceTop','mainControls','workspaceFooter'])$(id).hidden=false;
+ $('fileName').textContent=info.name;
+ $('imageMeta').textContent=`${info.width.toLocaleString()} × ${info.height.toLocaleString()} · ${info.depth} 位 · ${info.profile}`;
+}
+async function loadFullPreview(info,id,epoch){
+ state.sharpening=true;$('editStatus').hidden=false;$('editStatus').textContent='正在载入完整清晰度…';
+ let images=[];
+ try{
+  images=await loadImages(['original','result','overlay'].map(kind=>imageURL(kind,info,id)));
+  if(epoch!==state.previewEpoch||state.id!==id||state.renderedRevision!==info.revision){for(const im of images)im.close();return;}
+  const previous={original:state.original,result:state.result,overlay:state.overlay};
+  [state.original,state.result,state.overlay]=images;images=[];
+  for(const key of ['original','result','overlay'])if(previous[key]&&previous[key]!==state[key])releaseImage(previous[key]);
+  state.fullResolution=true;draw();
+ }catch(e){
+  for(const im of images)im.close();
+  if(epoch===state.previewEpoch)toast(`${e.message} 当前仍可比较低清晰度结果。`,true);
+ }finally{
+  if(epoch===state.previewEpoch){state.sharpening=false;if(!state.busy)$('editStatus').hidden=true;}
+ }
+}
 async function preview(info,id=state.id){
+ const epoch=++state.previewEpoch;
  const patch=info.preview_patch,rect=patch?.bounds;
- const local=patch&&patch.from_revision===state.renderedRevision&&state.result&&state.overlay&&rect&&rect[2]*rect[3]<=2_000_000;
+ const local=state.fullResolution&&patch&&patch.from_revision===state.renderedRevision&&state.result&&state.overlay&&rect&&rect[2]*rect[3]<=2_000_000;
  if(local&&rect[2]&&rect[3]){
   const images=await loadImages(['result','overlay'].map(kind=>imageURL(kind,info,id)+`&rect=${rect.join(',')}`));
+  if(epoch!==state.previewEpoch){for(const im of images)im.close();return;}
   try{
    const result=mutableImage(state.result),overlay=mutableImage(state.overlay);
    result.getContext('2d').drawImage(images[0],rect[0],rect[1]);
@@ -86,12 +121,17 @@ async function preview(info,id=state.id){
    if(result!==state.result)releaseImage(state.result);if(overlay!==state.overlay)releaseImage(state.overlay);
    state.result=result;state.overlay=overlay;
   }finally{for(const im of images)im.close();}
+  state.sharpening=false;if(!state.busy)$('editStatus').hidden=true;
  }else if(!local){
-  const images=await loadImages(['result','overlay'].map(kind=>imageURL(kind,info,id)));
+  const maxEdge=progressive(info)?quickEdge:0;
+  const images=await loadImages(['result','overlay'].map(kind=>imageURL(kind,info,id,maxEdge)));
+  if(epoch!==state.previewEpoch||state.id!==id){for(const im of images)im.close();return;}
   for(const key of ['result','overlay'])releaseImage(state[key]);
   [state.result,state.overlay]=images;
+  state.fullResolution=!progressive(info);
  }
  state.renderedRevision=info.revision;state.pendingPreview=false;state.ready=true;$('retryBar').hidden=true;
+ if(!local&&progressive(info))loadFullPreview(info,id,epoch);
 }
 function needsSave(){return !!state.id&&state.info.revision>0&&state.savedRevision!==state.info.revision;}
 async function confirmLeave(){
@@ -112,28 +152,63 @@ async function importPhoto(file,sample=false){
  if(file&&file.size>200*1024*1024){toast('单张照片不能超过 200 MB。',true);return;}
  if(file&&!/\.(jpe?g|png|tiff?)$/i.test(file.name)){toast('请导入 JPEG、PNG 或 TIFF。',true);return;}
  if(!await confirmLeave()){$('fileInput').value='';return;}
- const started=performance.now();busy(true,'1 / 3 · 正在读取照片…');let uploaded=null,images=[];
+ const started=performance.now();busy(true,'1 / 3 · 正在读取照片…');let uploaded=null,images=[],revealed=false,committed=false;
+ const epoch=++state.previewEpoch;
  try{
   const retain=encodeURIComponent(state.id||'');
   uploaded=await(await api(sample?`/api/sample?retain=${retain}`:`/api/upload?name=${encodeURIComponent(file.name)}&retain=${retain}`,sample?{}:file,!sample)).json();
+  if(epoch!==state.previewEpoch)throw Error('导入已取消。');
+  const large=progressive(uploaded),showEarly=large&&!state.id;
   $('busyText').textContent='2 / 3 · 正在识别并去除灰尘…';
-  const processed=await(await api('/api/process',{id:uploaded.id,level:'auto',options:preferences})).json();
-  const info={...uploaded,...processed};$('busyText').textContent='3 / 3 · 正在生成完整对比…';
-  images=await loadImages(['original','result','overlay'].map(kind=>imageURL(kind,info,uploaded.id)));
+  const processedPromise=api('/api/process',{id:uploaded.id,level:'auto',options:preferences}).then(r=>r.json());
+  if(showEarly){
+   loadImage(imageURL('original',uploaded,uploaded.id,quickEdge)).then(image=>{
+    if(committed||epoch!==state.previewEpoch||state.renderedRevision!=null){image.close();return;}
+    const previous=state.original;
+    state.id=uploaded.id;state.info=uploaded;state.original=image;state.result=null;state.overlay=null;
+    state.ready=false;state.fullResolution=false;state.renderedRevision=null;
+    if(previous&&previous!==image)releaseImage(previous);
+    showPhoto(uploaded);$('resultSummary').textContent='正在识别并去除灰尘…';
+    $('correctionPanel').hidden=true;$('retryBar').hidden=true;revealed=true;
+    busy(true,'2 / 3 · 正在识别并去除灰尘…',true);setView('original');fit();
+   }).catch(()=>{});
+  }
+  const processed=await processedPromise;
+  if(epoch!==state.previewEpoch)throw Error('导入已取消。');
+  const info={...uploaded,...processed};
+  if(revealed)busy(true,'3 / 3 · 正在生成对比…',true);
+  else $('busyText').textContent='3 / 3 · 正在生成对比…';
+  const maxEdge=large?quickEdge:0;
+  images=await loadImages(['original','result','overlay'].map(kind=>imageURL(kind,info,uploaded.id,maxEdge)));
+  if(epoch!==state.previewEpoch){for(const im of images)im.close();images=[];throw Error('导入已取消。');}
   await api('/api/activate',{id:uploaded.id});
-  const previous=state.id;
-  for(const key of ['original','result','overlay'])releaseImage(state[key]);
+  const previous=revealed?null:state.id;
+  const prior={original:state.original,result:state.result,overlay:state.overlay};
   state.id=uploaded.id;state.lossyConfirmedFor=null;[state.original,state.result,state.overlay]=images;images=[];
-  state.ready=true;state.pendingPreview=false;state.renderedRevision=info.revision;state.savedRevision=null;state.cloneSource=null;state.reviewIndex=0;state.lastDuration=null;state.lastEditDuration=null;
-  $('saveNotice').hidden=true;updateInfo(info);$('empty').hidden=true;canvas.hidden=false;
-  for(const id of ['workspaceTop','mainControls','workspaceFooter'])$(id).hidden=false;
+  for(const key of ['original','result','overlay'])if(prior[key]&&prior[key]!==state[key])releaseImage(prior[key]);
+  state.ready=true;state.pendingPreview=false;state.fullResolution=!large;state.renderedRevision=info.revision;state.savedRevision=null;state.cloneSource=null;state.reviewIndex=0;state.lastDuration=null;state.lastEditDuration=null;
+  $('saveNotice').hidden=true;updateInfo(info);showPhoto(info);
   $('correctionPanel').hidden=true;$('correctBtn').setAttribute('aria-expanded','false');$('retryBar').hidden=true;
   setTool('pan');fit();setView('compare');
   await afterPreviewDraw();
   state.lastDuration=(performance.now()-started)/1000;updateInfo(info);
+  committed=true;
   if(previous)api('/api/release',{id:previous}).catch(()=>{});
   if(info.notes.length)toast(info.notes.join(' '));
- }catch(e){for(const im of images)im.close();if(uploaded&&uploaded.id!==state.id)api('/api/release',{id:uploaded.id}).catch(()=>{});toast(`${e.message}${state.id?' 当前照片仍可继续处理。':''}`,true);}
+  if(large)loadFullPreview(info,uploaded.id,epoch);
+ }catch(e){
+  state.previewEpoch++;
+  for(const im of images)im.close();
+  if(revealed&&!committed){
+   for(const key of ['original','result','overlay'])releaseImage(state[key]);
+   state.id=null;state.info=null;state.original=null;state.result=null;state.overlay=null;state.ready=false;state.renderedRevision=null;state.fullResolution=false;
+   $('empty').hidden=false;canvas.hidden=true;
+   for(const id of ['workspaceTop','mainControls','workspaceFooter'])$(id).hidden=true;
+   $('viewBadge').hidden=true;$('compareHelp').hidden=true;$('compareSlider').hidden=true;
+  }
+  if(uploaded&&uploaded.id!==state.id)api('/api/release',{id:uploaded.id}).catch(()=>{});
+  toast(`${e.message}${state.id?' 当前照片仍可继续处理。':''}`,true);
+ }
  finally{busy(false);$('fileInput').value='';}
 }
 function settingsOptions(){return normalizePreferences({sensitivity:Number($('sensitivity').value),size:Number($('size').value),polarity:$('polarity').value,protect:$('protect').checked,hairs:$('hairs').checked});}
@@ -146,7 +221,7 @@ async function synchronizeAfterFailure(){
  catch(_){markPreviewUnavailable();}
 }
 async function processPhoto(){
- if(state.busy||!state.id)return;busy(true,'正在识别并去除灰尘…');$('saveNotice').hidden=true;const started=performance.now();
+ if(state.busy||!state.id)return;busy(true,'正在识别并去除灰尘…',true);$('saveNotice').hidden=true;const started=performance.now();
  try{const info=await(await api('/api/process',{revision:state.info.revision,level:'auto',options:preferences})).json();state.ready=false;state.lastDuration=null;state.lastEditDuration=null;updateInfo(info);await preview(info);state.cloneSource=null;state.reviewIndex=0;setTool('pan');setView('compare');await afterPreviewDraw();state.lastDuration=(performance.now()-started)/1000;updateInfo(info);}
  catch(e){await synchronizeAfterFailure();toast(e.message,true);}finally{busy(false);}
 }
@@ -214,18 +289,19 @@ function resize(){
 }
 function fit() {
   if(!state.original)return;state.fitted=true;state.viewportW=stage.clientWidth;state.viewportH=stage.clientHeight;
-  state.scale=Math.min((stage.clientWidth-54)/state.original.width,(stage.clientHeight-44)/state.original.height,1);
-  state.ox=(stage.clientWidth-state.original.width*state.scale)/2;
-  state.oy=(stage.clientHeight-state.original.height*state.scale)/2;
+  const width=photoWidth(),height=photoHeight();
+  state.scale=Math.min((stage.clientWidth-54)/width,(stage.clientHeight-44)/height,1);
+  state.ox=(stage.clientWidth-width*state.scale)/2;
+  state.oy=(stage.clientHeight-height*state.scale)/2;
   draw();
 }
 function zoom(scale,cx=stage.clientWidth/2,cy=stage.clientHeight/2) {
   if(!state.original)return;state.fitted=false;
-  const min=Math.min(.025,(stage.clientWidth-54)/state.original.width/2);
+  const min=Math.min(.025,(stage.clientWidth-54)/photoWidth()/2);
   const next=Math.max(min,Math.min(8,scale)),ratio=next/state.scale;
   state.ox=cx-(cx-state.ox)*ratio;state.oy=cy-(cy-state.oy)*ratio;state.scale=next;draw();
 }
-function drawImage(im) {ctx.drawImage(im,state.ox,state.oy,im.width*state.scale,im.height*state.scale);}
+function drawImage(im) {ctx.drawImage(im,state.ox,state.oy,photoWidth()*state.scale,photoHeight()*state.scale);}
 function draw() {
   const dpr=window.devicePixelRatio||1,w=stage.clientWidth,h=stage.clientHeight;
   ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);
