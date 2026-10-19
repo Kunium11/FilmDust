@@ -1,7 +1,7 @@
 'use strict';
 const $=id=>document.getElementById(id), token=document.querySelector('meta[name="film-token"]').content;
 const state={id:null,info:null,original:null,result:null,mask:null,overlay:null,view:'compare',tool:'pan',scale:1,ox:0,oy:0,split:.5,busy:false,pointer:null,space:false,compareBefore:false,cloneSource:null,reviewIndex:0,reviewGroups:[],reviewPoint:null,ready:false,custom:false,lossyConfirmedFor:null,outdated:false,fitted:true,viewportW:0,viewportH:0,savedRevision:null,renderedRevision:null,pendingPreview:false,lastDuration:null,lastEditDuration:null,fullResolution:false,previewEpoch:0,sharpening:false};
-const quickEdge=2048;
+const quickEdge=2048; // Keep in step with QUICK_PREVIEW_EDGE. The first Auto pass detects on this edge.
 const stage=$('stage'),canvas=$('viewer'),ctx=canvas.getContext('2d');let toastTimer;
 function toast(message,error=false){$('toast').textContent=message;$('toast').classList.toggle('error',error);$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,error?8000:3500);}
 const defaults={sensitivity:70,size:30,polarity:'light',protect:true,hairs:true};
@@ -24,7 +24,7 @@ function interactive(){
  $('undoBtn').disabled=!editable||!state.info?.undo;
  $('redoBtn').disabled=!editable||!state.info?.redo;
  for(const id of ['keepBtn','restoreBtn','previousBtn','nextBtn'])$(id).disabled=!editable||!state.reviewGroups.length;
- $('exportBtn').title=state.pendingPreview?'请先重新加载预览':'保存当前显示结果的副本';
+ $('exportBtn').title=state.info?.export_ready===false?'完整结果完成后才能保存':(state.pendingPreview?'请先重新加载预览':'保存当前显示结果的副本');
 }
 let busyTimer,busyStarted;
 function busy(on,message='正在自动处理…',local=false){
@@ -66,7 +66,11 @@ function updateInfo(info){
  $('imageMeta').textContent=`${info.width.toLocaleString()} × ${info.height.toLocaleString()} · ${info.depth} 位 · ${info.profile}`;
  buildReviewGroups();const kept=(info.reviews||[]).length;
  const duration=state.lastEditDuration!==null?` · 本次修正 ${state.lastEditDuration.toFixed(1)} 秒`:state.lastDuration===null?'':` · ${state.lastDuration.toFixed(1)} 秒`;
- $('resultSummary').textContent=info.healing?(info.count||kept?`已处理 ${info.processed_count} 处${duration}${kept?` · ${kept} 处保留原样`:''}`:info.detection?.automatic?`未发现需要自动处理的位置${duration}`:'已恢复原图'):'原图已导入';
+ if(info.preview_stage==='quick'){
+  $('resultSummary').textContent=`低分辨率对比已显示${duration} · 完整结果仍在计算，保存会等待`;
+ }else{
+  $('resultSummary').textContent=info.healing?(info.count||kept?`已处理 ${info.processed_count} 处${duration}${kept?` · ${kept} 处保留原样`:''}`:info.detection?.automatic?`未发现需要自动处理的位置${duration}`:'已恢复原图'):'原图已导入';
+ }
  $('keptBar').hidden=!state.reviewGroups.length;$('keptText').textContent=kept?`红色是改动，黄色是保留的疑点。可直接保存，也可按需检查。`:'红色是已处理位置。误修可点击还原。';
  $('reviewBtn').textContent=`检查改动 · ${state.reviewGroups.length} 个区域`;
  const png=$('exportFormat').querySelector('[value="png"]');png.disabled=info.depth===16;
@@ -160,8 +164,7 @@ async function importPhoto(file,sample=false){
   uploaded=await(await api(sample?`/api/sample?retain=${retain}`:`/api/upload?name=${encodeURIComponent(file.name)}&retain=${retain}`,sample?{}:file,!sample)).json();
   if(epoch!==state.previewEpoch)throw Error('导入已取消。');
   const large=progressive(uploaded),showEarly=large&&!state.id;
-  $('busyText').textContent='2 / 3 · 正在识别并去除灰尘…';
-  const processedPromise=api('/api/process',{id:uploaded.id,level:'auto',options:preferences}).then(r=>r.json());
+  $('busyText').textContent=large?'2 / 3 · 正在生成低分辨率对比…':'2 / 3 · 正在识别并去除灰尘…';
   if(showEarly){
    loadImage(imageURL('original',uploaded,uploaded.id,quickEdge)).then(image=>{
     if(committed||epoch!==state.previewEpoch||state.renderedRevision!=null){image.close();return;}
@@ -169,12 +172,38 @@ async function importPhoto(file,sample=false){
     state.id=uploaded.id;state.info=uploaded;state.original=image;state.result=null;state.overlay=null;
     state.ready=false;state.fullResolution=false;state.renderedRevision=null;
     if(previous&&previous!==image)releaseImage(previous);
-    showPhoto(uploaded);$('resultSummary').textContent='正在识别并去除灰尘…';
+    showPhoto(uploaded);$('resultSummary').textContent='正在生成低分辨率对比…';
     $('correctionPanel').hidden=true;$('retryBar').hidden=true;revealed=true;
-    busy(true,'2 / 3 · 正在识别并去除灰尘…',true);setView('original');fit();
+    busy(true,'2 / 3 · 正在生成低分辨率对比…',true);setView('original');fit();
    }).catch(()=>{});
   }
-  const processed=await processedPromise;
+  if(large){
+   try{
+    const previewInfo=await(await api('/api/process',{id:uploaded.id,level:'auto',options:preferences,stage:'preview'})).json();
+    if(epoch!==state.previewEpoch)throw Error('导入已取消。');
+    const compareInfo={...uploaded,...previewInfo};
+    const quickImages=await loadImages(['original','result','overlay'].map(kind=>imageURL(kind,compareInfo,uploaded.id,quickEdge)));
+    if(epoch!==state.previewEpoch){for(const im of quickImages)im.close();throw Error('导入已取消。');}
+    await api('/api/activate',{id:uploaded.id});
+    const previous=state.id&&state.id!==uploaded.id?state.id:null;
+    const prior={original:state.original,result:state.result,overlay:state.overlay};
+    state.id=uploaded.id;state.lossyConfirmedFor=null;[state.original,state.result,state.overlay]=quickImages;
+    for(const key of ['original','result','overlay'])if(prior[key]&&prior[key]!==state[key])releaseImage(prior[key]);
+    state.ready=false;state.pendingPreview=false;state.fullResolution=false;state.renderedRevision=compareInfo.revision;
+    state.savedRevision=null;state.cloneSource=null;state.reviewIndex=0;state.lastEditDuration=null;
+    state.lastDuration=(performance.now()-started)/1000;
+    $('saveNotice').hidden=true;updateInfo(compareInfo);showPhoto(compareInfo);
+    $('correctionPanel').hidden=true;$('correctBtn').setAttribute('aria-expanded','false');$('retryBar').hidden=true;
+    setTool('pan');fit();setView('compare');
+    await afterPreviewDraw();
+    revealed=true;committed=true;
+    if(previous)api('/api/release',{id:previous}).catch(()=>{});
+    busy(true,'3 / 3 · 正在计算完整结果…',true);
+   }catch(e){
+    if(epoch!==state.previewEpoch||`${e.message}`.includes('导入已取消'))throw e;
+   }
+  }
+  const processed=await(await api('/api/process',{id:uploaded.id,level:'auto',options:preferences})).json();
   if(epoch!==state.previewEpoch)throw Error('导入已取消。');
   const info={...uploaded,...processed};
   if(revealed)busy(true,'3 / 3 · 正在生成对比…',true);
@@ -223,7 +252,23 @@ async function synchronizeAfterFailure(){
 }
 async function processPhoto(){
  if(state.busy||!state.id)return;busy(true,'正在识别并去除灰尘…',true);$('saveNotice').hidden=true;const started=performance.now();
- try{const info=await(await api('/api/process',{revision:state.info.revision,level:'auto',options:preferences})).json();state.ready=false;state.lastDuration=null;state.lastEditDuration=null;updateInfo(info);await preview(info);state.cloneSource=null;state.reviewIndex=0;setTool('pan');setView('compare');await afterPreviewDraw();state.lastDuration=(performance.now()-started)/1000;updateInfo(info);}
+ try{
+  if(progressive(state.info)){
+   busy(true,'正在生成低分辨率对比…',true);
+   try{
+    const quick=await(await api('/api/process',{revision:state.info.revision,level:'auto',options:preferences,stage:'preview'})).json();
+    const images=await loadImages(['original','result','overlay'].map(kind=>imageURL(kind,quick,state.id,quickEdge)));
+    const prior={original:state.original,result:state.result,overlay:state.overlay};
+    [state.original,state.result,state.overlay]=images;
+    for(const key of ['original','result','overlay'])if(prior[key]&&prior[key]!==state[key])releaseImage(prior[key]);
+    state.ready=false;state.fullResolution=false;state.lastDuration=(performance.now()-started)/1000;state.lastEditDuration=null;
+    updateInfo(quick);setTool('pan');setView('compare');
+    await afterPreviewDraw();
+   }catch(e){if(!state.id)throw e;}
+   busy(true,'正在计算完整结果…',true);
+  }
+  const info=await(await api('/api/process',{revision:state.info.revision,level:'auto',options:preferences})).json();state.ready=false;state.lastDuration=null;state.lastEditDuration=null;updateInfo(info);await preview(info);state.cloneSource=null;state.reviewIndex=0;setTool('pan');setView('compare');await afterPreviewDraw();state.lastDuration=(performance.now()-started)/1000;updateInfo(info);
+ }
  catch(e){await synchronizeAfterFailure();toast(e.message,true);}finally{busy(false);}
 }
 async function retryPreview(){
@@ -275,7 +320,7 @@ function nativeSave(format,name){
  });
 }
 async function saveCopy(){
- if(state.busy||!state.ready||state.renderedRevision!==state.info.revision)return false;busy(true,'正在生成原尺寸副本…');
+ if(state.busy||!state.ready||state.info?.export_ready===false||state.renderedRevision!==state.info.revision)return false;busy(true,'正在生成原尺寸副本…');
  try{const fmt=$('exportFormat').value,name=state.info.name.replace(/\.[^.]+$/,'')+'_除尘'+{tiff:'.tif',png:'.png',jpeg:'.jpg'}[fmt];
   if(window.webkit?.messageHandlers?.filmExport){const path=await nativeSave(fmt,name);if(path){$('saveNotice').textContent=`已保存副本：${path}`;$('saveNotice').hidden=false;state.savedRevision=state.info.revision;return true;}return false;}
   const r=await api('/api/export',{format:fmt,revision:state.info.revision}),blob=await r.blob(),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);$('saveNotice').textContent=`已生成副本：${name} · 请在浏览器下载位置查看。`;$('saveNotice').hidden=false;state.savedRevision=state.info.revision;return true;

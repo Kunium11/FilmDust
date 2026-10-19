@@ -92,7 +92,7 @@ class Handler(BaseHTTPRequestHandler):
                     data = data.replace(b"__TOKEN__", TOKEN.encode())
                 self.send(data, mime=mime)
             elif u.path == "/api/health":
-                self.send({"ok": True, "local": True, "version": "1.8.5", "ai": False, "automatic": True})
+                self.send({"ok": True, "local": True, "version": "1.8.6", "ai": False, "automatic": True})
             elif u.path == "/api/image":
                 # Session lookup is global. Original bytes are immutable and can be
                 # served while detect holds the photo lock. Result and overlay need
@@ -193,27 +193,35 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     if body.get("revision") is not None and body["revision"] != photo.revision:
                         raise ValueError("照片已更新，请先重新加载预览。")
-                    with photo.transaction():
-                        if u.path == "/api/process":
-                            photo.process(body.get("level", "auto"), body.get("options"))
-                        elif u.path == "/api/detect":
-                            photo.detect(body.get("sensitivity", 50), body.get("size", 30), body.get("hairs", True), body.get("protect", True), body.get("polarity", "both"))
-                        elif u.path == "/api/edit":
-                            photo.edit(body.get("mode"), body.get("points", []), body.get("diameter", 18))
-                        elif u.path == "/api/clone":
-                            photo.clone(body.get("source"), body.get("points", []), body.get("diameter", 18))
-                        elif u.path == "/api/keep":
-                            photo.keep_regions(body.get("points", []))
-                        elif u.path == "/api/undo":
-                            photo.undo()
-                        elif u.path == "/api/redo":
-                            photo.redo()
-                        elif u.path == "/api/clear":
-                            photo.clear()
-                        elif u.path == "/api/heal":
-                            photo.heal()
-                        else:
-                            raise ValueError("操作不存在。")
+                    if u.path == "/api/process" and body.get("stage") == "preview":
+                        # Scaled compare only. Full Auto is a later /api/process.
+                        # Stay outside the transaction so this does not heal or
+                        # install an exportable result.
+                        photo.prepare_quick_compare(body.get("level", "auto"), body.get("options"))
+                    elif photo.quick_compare_pending_full and u.path != "/api/process":
+                        raise ValueError("完整结果尚未完成，请等自动除尘结束后再修改。")
+                    else:
+                        with photo.transaction():
+                            if u.path == "/api/process":
+                                photo.process(body.get("level", "auto"), body.get("options"))
+                            elif u.path == "/api/detect":
+                                photo.detect(body.get("sensitivity", 50), body.get("size", 30), body.get("hairs", True), body.get("protect", True), body.get("polarity", "both"))
+                            elif u.path == "/api/edit":
+                                photo.edit(body.get("mode"), body.get("points", []), body.get("diameter", 18))
+                            elif u.path == "/api/clone":
+                                photo.clone(body.get("source"), body.get("points", []), body.get("diameter", 18))
+                            elif u.path == "/api/keep":
+                                photo.keep_regions(body.get("points", []))
+                            elif u.path == "/api/undo":
+                                photo.undo()
+                            elif u.path == "/api/redo":
+                                photo.redo()
+                            elif u.path == "/api/clear":
+                                photo.clear()
+                            elif u.path == "/api/heal":
+                                photo.heal()
+                            else:
+                                raise ValueError("操作不存在。")
                     payload = mime_out = headers = None
                     info = photo.info()
             if info is None:

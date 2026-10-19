@@ -15,6 +15,9 @@ from PIL import Image, ImageCms, ImageOps
 
 MAX_PIXELS = 100_000_000
 # Longest edge of the first comparison. Full-frame previews replace it later.
+# The first Auto pass detects on this same edge and scales kernels, dust size
+# and length thresholds by (quick edge / full long edge). Scale 1, including
+# every photo that already fits, keeps the full-resolution literals.
 QUICK_PREVIEW_EDGE = 2048
 # Median kernels in the detection tiles do not speed up when OpenCV adds
 # threads. Tiles run side by side instead. The automatic count follows this
@@ -26,6 +29,145 @@ _DETECT_WORKER_CAP = 8
 UNDO_BYTE_BUDGET = 256 * 1024 * 1024
 UNDO_STEP_LIMIT = 12
 _PATCH_TILE = 128
+_LEVEL_LENGTH = {"auto": 1000, "gentle": 160, "standard": 240, "more": 400}
+
+
+def _as_scale(spatial_scale):
+    """1 keeps full-resolution pixel sizes. Smaller values are a preview."""
+    if spatial_scale is None:
+        return 1.0
+    scale = float(spatial_scale)
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("预览缩放无效。")
+    return 1.0 if scale >= 1.0 else scale
+
+
+def scale_kernel(value, scale, minimum=3):
+    """Odd median or morphology kernel. Scale 1 returns the original integer."""
+    value = int(value)
+    scale = _as_scale(scale)
+    if scale == 1.0:
+        return value
+    target = value * scale
+    k = int(round(target))
+    if k % 2 == 0:
+        lower, upper = k - 1, k + 1
+        k = lower if abs(lower - target) <= abs(upper - target) else upper
+    if k < minimum:
+        k = minimum if minimum % 2 == 1 else minimum + 1
+    return int(k)
+
+
+def scale_length(value, scale, minimum=1):
+    """Pixel length. Scale 1 returns the original number and type."""
+    scale = _as_scale(scale)
+    if scale == 1.0:
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return max(int(minimum), int(round(value * scale)))
+    return max(float(minimum), float(value) * scale)
+
+
+def scale_area(value, scale, minimum=1):
+    """Pixel area. It shrinks with the square of the linear scale."""
+    value = int(value)
+    scale = _as_scale(scale)
+    if scale == 1.0:
+        return value
+    return max(int(minimum), int(round(value * scale * scale)))
+
+
+def scale_sigma(value, scale, minimum=0.3):
+    """Gaussian sigma in pixels. Scale 1 returns the original number."""
+    scale = _as_scale(scale)
+    if scale == 1.0:
+        return value
+    return max(float(minimum), float(value) * scale)
+
+
+def scaled_dust_size(size, scale):
+    """Dust-size setting in pixels of the image actually being detected."""
+    size = int(np.clip(int(size), 4, 100))
+    scale = _as_scale(scale)
+    if scale == 1.0:
+        return size
+    return int(np.clip(int(round(size * scale)), 4, 100))
+
+
+def spatial_parameters(scale=1.0):
+    """Kernels and pixel thresholds. Scale 1 is the full-resolution Auto path."""
+    scale = _as_scale(scale)
+    return {
+        "scale": scale,
+        "light_median": scale_kernel(31, scale),
+        "light_fine_median": scale_kernel(5, scale),
+        "light_noise_median": scale_kernel(9, scale),
+        "light_scene_median": scale_kernel(7, scale),
+        "light_sigma": scale_sigma(1.4, scale),
+        "light_scene_sigma": scale_sigma(0.8, scale),
+        "light_band_sigma": scale_sigma(4, scale),
+        "light_detail_sigma": scale_sigma(15, scale),
+        "light_box": scale_kernel(81, scale),
+        "light_boundary": scale_kernel(5, scale),
+        "light_halo": scale_length(96, scale),
+        "strong_median": scale_kernel(21, scale),
+        "strong_fine_median": scale_kernel(5, scale),
+        "strong_noise_median": scale_kernel(9, scale),
+        "strong_scene_median": scale_kernel(7, scale),
+        "strong_sigma": scale_sigma(1.5, scale),
+        "strong_variance_sigma": scale_sigma(7, scale),
+        "strong_halo": scale_length(32, scale),
+        "strong_boundary": scale_kernel(7, scale),
+        "strong_dilate": scale_kernel(3, scale),
+        "strong_min_area": scale_area(4, scale),
+        "strong_thickness": scale_length(7, scale),
+        "frame_area": scale_area(64, scale),
+        "frame_dilate": scale_kernel(17, scale),
+        "frame_margin": scale_length(2, scale),
+        "close_ellipse": scale_kernel(3, scale),
+        "min_component_area": scale_area(8, scale),
+        "hair_length_cap": scale_length(1000, scale),
+        "hair_thickness": scale_length(18, scale),
+        "hair_radius": scale_length(9, scale),
+        "hair_bend": 1.5 if scale == 1.0 else max(0.2, 1.5 * scale),
+        "hair_short": scale_length(65, scale),
+        "crowd_box": scale_kernel(121, scale),
+        "core_open": scale_kernel(5, scale),
+        "core_min_area": scale_area(4, scale),
+        "core_island_area": scale_area(3, scale),
+        "core_distance": 3 if scale == 1.0 else max(1.0, 3 * scale),
+        "core_recover": scale_kernel(9, scale),
+        "core_dilate": scale_kernel(3, scale),
+        "final_dilate": scale_kernel(3, scale),
+        "split_pad": scale_length(40, scale),
+        "split_median": scale_kernel(31, scale),
+        "split_scene_median": scale_kernel(7, scale),
+        "split_sigma": scale_sigma(1.4, scale),
+        "split_band_sigma": scale_sigma(4, scale),
+        "split_region": scale_length(6, scale),
+        "split_long_auto": scale_length(80, scale),
+        "split_long_other": scale_length(16, scale),
+        "split_straight": scale_length(57, scale),
+        "straight_min_count": scale_area(48, scale),
+        "straight_min_length": scale_length(80, scale),
+        "straight_max_thick": scale_length(24, scale),
+        "straight_min_thick": 0.7 if scale == 1.0 else max(0.25, 0.7 * scale),
+        "straight_bend": 3 if scale == 1.0 else max(0.25, 3 * scale),
+        "straight_dist": 10.0 if scale == 1.0 else max(0.5, 10.0 * scale),
+    }
+
+
+def _resolve_auto(level, options):
+    """Default Auto matches the app: sensitivity 70, size 30, light, protect, hairs."""
+    if level not in ("auto", "gentle", "standard", "more"):
+        raise ValueError("无法识别去除程度。")
+    options = options or {}
+    sensitivity = float(options.get("sensitivity", {"auto": 70, "gentle": 40, "standard": 50, "more": 65}[level]))
+    polarity = options.get("polarity", "light")
+    if polarity not in ("both", "light", "dark"):
+        raise ValueError("未知灰尘颜色设置。")
+    size = int(options.get("size", 30))
+    return (sensitivity, size, bool(options.get("hairs", True)), bool(options.get("protect", True)), polarity)
 
 
 def _change_mask(before_result, after_result, before_mask, after_mask, before_pending, after_pending):
@@ -201,6 +343,15 @@ class Photo:
         self.lock = threading.RLock()
         self.quick_original = None
         self.quick_original_is_full = False
+        self.quick_display = None
+        self.quick_scale = 1.0
+        self.quick_compare_pending_full = False
+        self.quick_result_bytes = None
+        self.quick_overlay_bytes = None
+        self.quick_selected = None
+        self.quick_pending = None
+        self.quick_summary = None
+        self.preview_stage = "none"
         self._cache_quick_original()
 
     def _cache_quick_original(self):
@@ -208,13 +359,18 @@ class Photo:
 
         Large scans use the same downscale-then-display path as the quick result,
         so the first comparison does not compare two different color pipelines.
+        The array is also the working image for the scaled first Auto pass.
         """
-        if max(self.height, self.width) <= QUICK_PREVIEW_EDGE:
+        long_edge = max(self.height, self.width)
+        if long_edge <= QUICK_PREVIEW_EDGE:
             displayed = self.preview
             self.quick_original_is_full = True
+            self.quick_scale = 1.0
         else:
             displayed = self.display(downscale(self.original, QUICK_PREVIEW_EDGE))
             self.quick_original_is_full = False
+            self.quick_scale = max(displayed.shape[:2]) / long_edge
+        self.quick_display = displayed
         self.quick_original = lossy_preview_bytes(displayed)
 
     def _quick_original_matches(self, max_edge):
@@ -225,8 +381,23 @@ class Photo:
         long_edge = max(self.height, self.width)
         return max_edge == QUICK_PREVIEW_EDGE or (self.quick_original_is_full and max_edge >= long_edge)
 
+    def _quick_compare_frame(self, kind, full):
+        """Full-frame bytes from the scaled Auto pass, before full Auto replaces them."""
+        if not (full and self.quick_compare_pending_full):
+            return None
+        if kind == "result" and self.quick_result_bytes is not None:
+            return self.quick_result_bytes
+        if kind == "overlay" and self.quick_overlay_bytes is not None:
+            return self.quick_overlay_bytes
+        if kind == "mask" and self.quick_selected is not None:
+            return lossy_preview_bytes(self.quick_selected)
+        return None
+
     def render_preview(self, kind, region, max_edge=None, full=True):
         """Lossy bytes for /api/image. Does not change detection or heal pixels."""
+        quick = self._quick_compare_frame(kind, full)
+        if quick is not None:
+            return quick
         detailed = not full
         if kind == "original":
             if full and self._quick_original_matches(max_edge):
@@ -262,7 +433,8 @@ class Photo:
         """An edit and its repair are one operation, including undo on failure."""
         saved = {key: getattr(self, key) for key in (
             "mask", "pending_mask", "detection_report", "history", "_redo", "clone_strokes",
-            "revision", "healed_revision", "result", "heal_report", "preview_patch", "edit_report")}
+            "revision", "healed_revision", "result", "heal_report", "preview_patch", "edit_report",
+            "quick_compare_pending_full")}
         self.mask = self.mask.copy()
         self.history = list(self.history)
         self._redo = list(self._redo)
@@ -526,15 +698,58 @@ class Photo:
                     profile="原色彩配置已保留" if self.icc else "原图未嵌入色彩配置",
                     healing=self.heal_report, pending_count=int(pending_count), pending_points=pending_points, detection=self.detection_report,
                     processed_count=int(repaired), reviews=reviews, changes=changes,
-                    preview_patch=self.preview_patch, edit=self.edit_report)
+                    preview_patch=self.preview_patch, edit=self.edit_report,
+                    preview_stage="quick" if self.quick_compare_pending_full else ("full" if self.result is not None and self.healed_revision == self.revision else "none"),
+                    export_ready=not self.quick_compare_pending_full,
+                    quick=self.quick_summary if self.quick_compare_pending_full else None)
+
+    def prepare_quick_compare(self, level="auto", options=None):
+        """Run Auto on the downscaled working image so a compare can show early.
+
+        Kernels, dust size and length thresholds scale with the image. This does
+        not install the exportable mask or result. Full Auto still does that.
+        Photos that already fit in the quick edge leave this as a no-op.
+        """
+        key = _resolve_auto(level, options)
+        if self.quick_scale >= 1.0 or self.quick_display is None:
+            return None
+        working = self.quick_display
+        scale = self.quick_scale
+        spatial = spatial_parameters(scale)
+        capture = {}
+        proposal = detect_dust(working, *key, capture=capture, spatial_scale=scale)
+        alpha_small = None
+        if self.alpha is not None:
+            alpha_small = downscale(self.alpha, QUICK_PREVIEW_EDGE, cv2.INTER_NEAREST)
+            if alpha_small.shape != proposal.shape:
+                alpha_small = cv2.resize(alpha_small, (proposal.shape[1], proposal.shape[0]), interpolation=cv2.INTER_NEAREST)
+            proposal[alpha_small == 0] = 0
+        selected, pending, summary = split_automatic_candidates(working, proposal, level, key[-1], spatial_scale=scale)
+        if alpha_small is not None:
+            selected = selected.copy()
+            pending = pending.copy()
+            selected[alpha_small == 0] = 0
+            pending[alpha_small == 0] = 0
+        healed = heal_mask(working, selected)
+        overlay = np.zeros((selected.shape[0], selected.shape[1], 4), np.uint8)
+        overlay[pending > 0] = [242, 195, 79, 180]
+        overlay[selected > 0] = [244, 91, 66, 155]
+        summary.update(level=level, sensitivity=float(key[0]), size=int(key[1]), automatic=True, custom=bool(options),
+                       spatial_scale=float(scale), scaled_size=int(capture["size"]),
+                       light_median=int(capture["light_median"]),
+                       settings=dict(sensitivity=key[0], size=key[1], hairs=key[2], protect=key[3], polarity=key[4]))
+        self.quick_selected = selected
+        self.quick_pending = pending
+        self.quick_summary = summary
+        self.quick_result_bytes = lossy_preview_bytes(healed)
+        self.quick_overlay_bytes = lossy_preview_bytes(overlay)
+        self.quick_compare_pending_full = True
+        self.preview_stage = "quick"
+        return summary
 
     def process(self, level="gentle", options=None):
-        if level not in ("auto", "gentle", "standard", "more"):
-            raise ValueError("无法识别去除程度。")
-        options = options or {}
-        sensitivity = options.get("sensitivity", {"auto":70, "gentle":40, "standard":50, "more":65}[level])
-        key = (float(sensitivity), int(options.get("size", 30)), bool(options.get("hairs", True)),
-               bool(options.get("protect", True)), options.get("polarity", "light"))
+        key = _resolve_auto(level, options)
+        sensitivity = key[0]
         proposal = self.proposal_cache.get(key)
         if proposal is None:
             proposal = detect_dust(self.preview, *key)
@@ -554,6 +769,12 @@ class Photo:
         self.result = result
         self.healed_revision = self.revision
         self._seal_latest()
+        # Full Auto is the exportable result. Drop the provisional compare bytes
+        # only after that result is installed. The low-res mask stays for measurement.
+        self.quick_compare_pending_full = False
+        self.quick_result_bytes = None
+        self.quick_overlay_bytes = None
+        self.preview_stage = "full"
 
     def detect(self, sensitivity=50, size=30, hairs=True, protect=True, polarity="both"):
         key = (float(sensitivity), int(size), bool(hairs), bool(protect), polarity)
@@ -761,6 +982,8 @@ class Photo:
         return self.result
 
     def export(self, fmt):
+        if self.quick_compare_pending_full:
+            raise ValueError("完整结果尚未完成，请等自动除尘结束后再保存。")
         result = self.heal()
         stream = io.BytesIO()
         if fmt == "tiff":
@@ -827,14 +1050,16 @@ def _thin_skeleton(mask):
     return a[1:-1, 1:-1].astype(np.uint8)
 
 
-def _frame_exclusion(gray):
+def _frame_exclusion(gray, spatial_scale=1.0):
+    spatial = spatial_parameters(spatial_scale)
     height, width = gray.shape
     dark = (gray < 24).astype(np.uint8)
     _, labels, stats, _ = cv2.connectedComponentsWithStats(dark, 8)
     ids = np.unique(np.concatenate((labels[0], labels[-1], labels[:, 0], labels[:, -1])))
-    ids = ids[(ids > 0) & (stats[ids, cv2.CC_STAT_AREA] > 64)]
-    excluded = cv2.dilate(np.isin(labels, ids).astype(np.uint8), np.ones((17, 17), np.uint8))
-    margin = max(2, round(min(height, width) * .015))
+    ids = ids[(ids > 0) & (stats[ids, cv2.CC_STAT_AREA] > spatial["frame_area"])]
+    kernel = spatial["frame_dilate"]
+    excluded = cv2.dilate(np.isin(labels, ids).astype(np.uint8), np.ones((kernel, kernel), np.uint8))
+    margin = max(spatial["frame_margin"], round(min(height, width) * .015))
     excluded[:margin] = 1
     excluded[-margin:] = 1
     excluded[:, :margin] = 1
@@ -842,75 +1067,88 @@ def _frame_exclusion(gray):
     return excluded
 
 
-def _straight_structure_band(comp):
+def _straight_structure_band(comp, spatial_scale=1.0, spatial=None):
     """A long, narrow, nearly straight candidate is scene structure, not dust.
 
     Platform edges, safety lines, rails, wires and window bars are often diagonal,
     so the axis-aligned box is mostly empty and the filled-box hold never sees them.
     A wide median also erases a thin line, which is why the edge gate misses it.
     Measure length and straightness along the band itself. Sensitivity and the
-    existing split limits are unchanged. Curved strands stay selectable.
+    existing split limits are unchanged at full resolution. Curved strands stay
+    selectable. A preview scale shrinks the pixel lengths with the image.
     """
+    spatial = spatial if spatial is not None else spatial_parameters(spatial_scale)
     ys, xs = np.nonzero(comp)
     count = int(xs.size)
-    if count < 48:
+    if count < spatial["straight_min_count"]:
         return False
     points = np.column_stack((xs, ys)).astype(np.float32)
     vx, vy, xm, ym = cv2.fitLine(points, cv2.DIST_L2, 0, .01, .01).ravel()
     dist = np.abs((xs - xm) * vy - (ys - ym) * vx)
     tangent = xs * vx + ys * vy
     fit_len = float(tangent.max() - tangent.min()) + 1.
-    if fit_len < 80:
+    if fit_len < spatial["straight_min_length"]:
         return False
     thick = count / fit_len
-    if thick < .7 or thick > 24 or fit_len / thick < 8:
+    if thick < spatial["straight_min_thick"] or thick > spatial["straight_max_thick"] or fit_len / thick < 8:
         return False
     # A filled straight band sits about thick/4 from its centerline. Extra
     # deviation is bend. Window bars are a little uneven; arcs and blobs are not.
-    if float(np.mean(dist)) - thick / 4 > 3 or float(np.percentile(dist, 95)) > max(10., thick * 1.25):
+    if float(np.mean(dist)) - thick / 4 > spatial["straight_bend"] or float(np.percentile(dist, 95)) > max(spatial["straight_dist"], thick * 1.25):
         return False
     bins = max(8, int(fit_len))
     index = np.clip(((tangent - float(tangent.min())) / fit_len * (bins - 1)).astype(np.int32), 0, bins - 1)
     return float(np.count_nonzero(np.bincount(index, minlength=bins))) / bins >= .8
 
 
-def split_automatic_candidates(rgb, proposal, level="gentle", polarity="light"):
-    """Keep pixel/structure conflicts as original pixels, never an AI verdict."""
+def split_automatic_candidates(rgb, proposal, level="gentle", polarity="light", spatial_scale=1.0):
+    """Keep pixel/structure conflicts as original pixels, never an AI verdict.
+
+    spatial_scale 1 uses the full-resolution lengths. A preview scale shrinks
+    those lengths and the median kernel; intensity limits stay put.
+    """
+    spatial = spatial_parameters(spatial_scale)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(proposal, 8)
     take = np.zeros(n, np.uint8)
     hold = np.zeros(n, np.uint8)
     gray_all = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     height, width = proposal.shape
-    limits = {"auto": (5., .45, 15., 1000), "gentle": (1.3, .10, 4., 160), "standard": (1.7, .15, 6., 240), "more": (2., .20, 8., 400)}[level]
+    limits = {"auto": (5., .45, 15., _LEVEL_LENGTH["auto"]), "gentle": (1.3, .10, 4., _LEVEL_LENGTH["gentle"]),
+              "standard": (1.7, .15, 6., _LEVEL_LENGTH["standard"]), "more": (2., .20, 8., _LEVEL_LENGTH["more"])}[level]
     edge_limit, texture_limit, variation_limit, length_limit = limits
+    length_limit = scale_length(length_limit, spatial["scale"])
+    pad = spatial["split_pad"]
+    region_pad = spatial["split_region"]
+    long_cap = spatial["split_long_auto"] if level == "auto" else spatial["split_long_other"]
     for k in range(1, n):
         x, y, w, h, area = [int(v) for v in stats[k]]
-        x0, y0 = max(0, x - 40), max(0, y - 40)
-        x1, y1 = min(width, x + w + 40), min(height, y + h + 40)
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1, y1 = min(width, x + w + pad), min(height, y + h + pad)
         gray = gray_all[y0:y1, x0:x1]
-        ref = cv2.GaussianBlur(cv2.medianBlur(gray, 31).astype(np.float32), (0, 0), 1.4)
+        ref = cv2.GaussianBlur(cv2.medianBlur(gray, spatial["split_median"]).astype(np.float32), (0, 0), spatial["split_sigma"])
         ix, iy = x - x0, y - y0
-        region = np.s_[max(0, iy - 6):iy + h + 6, max(0, ix - 6):ix + w + 6]
+        region = np.s_[max(0, iy - region_pad):iy + h + region_pad, max(0, ix - region_pad):ix + w + region_pad]
         gradient = cv2.magnitude(cv2.Sobel(ref, cv2.CV_32F, 1, 0) / 8, cv2.Sobel(ref, cv2.CV_32F, 0, 1) / 8)[region]
-        scene = cv2.medianBlur(gray, 7).astype(np.float32)
-        band = np.abs(scene - cv2.GaussianBlur(scene, (0, 0), 4))
+        scene = cv2.medianBlur(gray, spatial["split_scene_median"]).astype(np.float32)
+        band = np.abs(scene - cv2.GaussianBlur(scene, (0, 0), spatial["split_band_sigma"]))
         background = ref[iy:iy + h, ix:ix + w]
         delta = (gray.astype(np.float32) - ref)[iy:iy + h, ix:ix + w]
         bright, dark = float(delta.max()), float(-delta.min())
         # 57px is the shorter side of an 80px diagonal, so a slanted safety line
-        # still reaches the straight-band check. Limits above are intentionally
-        # the same numbers as before.
+        # still reaches the straight-band check. Full-resolution limits stay the
+        # same numbers as before; a preview multiplies the pixel lengths by scale.
         unsafe = (max(w, h) > length_limit or np.mean(gradient > edge_limit) > .02 or
                   np.mean(band > 3) > texture_limit or np.std(background) > variation_limit or
-                  (max(w, h) > (80 if level == "auto" else 16) and max(w, h) / max(1, min(w, h)) > (8 if level == "auto" else 2.5) and area / (w * h) > .40) or
+                  (max(w, h) > long_cap and max(w, h) / max(1, min(w, h)) > (8 if level == "auto" else 2.5) and area / (w * h) > .40) or
                   (polarity == "light" and dark > max(12, bright * 1.5)) or
                   (polarity == "dark" and bright > max(12, dark * 1.5)) or
-                  (max(w, h) >= 57 and _straight_structure_band(labels[y:y + h, x:x + w] == k)))
+                  (max(w, h) >= spatial["split_straight"] and _straight_structure_band(labels[y:y + h, x:x + w] == k, spatial["scale"], spatial)))
         if unsafe:
             hold[k] = 255
         else:
             take[k] = 255
-    return take[labels], hold[labels], dict(candidates=n - 1, selected=int(np.count_nonzero(take)), kept=int(np.count_nonzero(hold)))
+    return take[labels], hold[labels], dict(candidates=n - 1, selected=int(np.count_nonzero(take)), kept=int(np.count_nonzero(hold)),
+                                            spatial_scale=float(spatial["scale"]), scaled_length=length_limit, split_median=int(spatial["split_median"]))
 
 
 def detect_worker_count():
@@ -952,26 +1190,34 @@ def _tile_origins(height, width):
     return [(y, x) for y in range(0, height, 1024) for x in range(0, width, 1024)]
 
 
-def _light_dust_tile(job, gray, extent, scores, scene, sensitivity, polarity):
-    """One light-dust block. The 96px halo is the serial neighborhood; only the inner block is written."""
+def _light_dust_tile(job, gray, extent, scores, scene, sensitivity, polarity, spatial=None):
+    """One light-dust block. The 96px halo is the serial neighborhood; only the inner block is written.
+
+    A preview spatial dict shrinks that halo and the median kernels. Scale 1
+    keeps 96 and median 31.
+    """
+    spatial = spatial_parameters(1.0) if spatial is None else spatial
     y, x = job
     height, width = gray.shape
-    y0, y1 = max(0, y - 96), min(height, y + 1120)
-    x0, x1 = max(0, x - 96), min(width, x + 1120)
+    halo = spatial["light_halo"]
+    y0, y1 = max(0, y - halo), min(height, y + 1024 + halo)
+    x0, x1 = max(0, x - halo), min(width, x + 1024 + halo)
     patch = gray[y0:y1, x0:x1]
     f = patch.astype(np.float32)
-    smooth = cv2.GaussianBlur(f, (0, 0), 1.4)
-    ref = cv2.GaussianBlur(cv2.medianBlur(patch, 31).astype(np.float32), (0, 0), 1.4)
+    smooth = cv2.GaussianBlur(f, (0, 0), spatial["light_sigma"])
+    ref = cv2.GaussianBlur(cv2.medianBlur(patch, spatial["light_median"]).astype(np.float32), (0, 0), spatial["light_sigma"])
     delta = smooth - ref
     residual = np.maximum(delta, 0) if polarity == "light" else np.maximum(-delta, 0) if polarity == "dark" else np.abs(delta)
-    noise = cv2.medianBlur(np.clip(np.abs(f - cv2.medianBlur(patch, 5)), 0, 255).astype(np.uint8), 9).astype(np.float32)
+    noise = cv2.medianBlur(np.clip(np.abs(f - cv2.medianBlur(patch, spatial["light_fine_median"])), 0, 255).astype(np.uint8), spatial["light_noise_median"]).astype(np.float32)
     score = residual / (2 + (100 - sensitivity) * .02 + noise * .55)
-    bg = cv2.GaussianBlur(cv2.medianBlur(patch, 7).astype(np.float32), (0, 0), .8)
-    band = np.abs(bg - cv2.GaussianBlur(bg, (0, 0), 4))
-    detail = cv2.GaussianBlur(band, (0, 0), 15)
-    occupancy = cv2.boxFilter((band > 2).astype(np.float32), -1, (81, 81))
+    bg = cv2.GaussianBlur(cv2.medianBlur(patch, spatial["light_scene_median"]).astype(np.float32), (0, 0), spatial["light_scene_sigma"])
+    band = np.abs(bg - cv2.GaussianBlur(bg, (0, 0), spatial["light_band_sigma"]))
+    detail = cv2.GaussianBlur(band, (0, 0), spatial["light_detail_sigma"])
+    box = spatial["light_box"]
+    occupancy = cv2.boxFilter((band > 2).astype(np.float32), -1, (box, box))
     gradient = cv2.magnitude(cv2.Sobel(ref, cv2.CV_32F, 1, 0) / 8, cv2.Sobel(ref, cv2.CV_32F, 0, 1) / 8)
-    boundaries = cv2.dilate((gradient > 5).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    boundary = spatial["light_boundary"]
+    boundaries = cv2.dilate((gradient > 5).astype(np.uint8), np.ones((boundary, boundary), np.uint8)) > 0
     excluded = ((detail > 1) & (occupancy > .40)) | boundaries
     sy, sx = y - y0, x - x0
     hh, ww = min(1024, height - y), min(1024, width - x)
@@ -982,31 +1228,38 @@ def _light_dust_tile(job, gray, extent, scores, scene, sensitivity, polarity):
     scene[target] = excluded[source].astype(np.uint8)
 
 
-def _fill_light_dust_tiles(gray, extent, scores, scene, sensitivity, polarity):
+def _fill_light_dust_tiles(gray, extent, scores, scene, sensitivity, polarity, spatial=None):
+    spatial = spatial_parameters(1.0) if spatial is None else spatial
     jobs = _tile_origins(*gray.shape)
 
     def tile(job):
-        _light_dust_tile(job, gray, extent, scores, scene, sensitivity, polarity)
+        _light_dust_tile(job, gray, extent, scores, scene, sensitivity, polarity, spatial)
 
     _run_tile_jobs(jobs, tile)
 
 
-def _strong_dust_tile(job, gray, candidate, strength, sensitivity, polarity, threshold):
-    """One strong-dust block. Same 32px halo and inner write as the serial loop."""
+def _strong_dust_tile(job, gray, candidate, strength, sensitivity, polarity, threshold, spatial=None):
+    """One strong-dust block. Same 32px halo and inner write as the serial loop.
+
+    A preview spatial dict shrinks the halo and median kernels. Scale 1 keeps
+    the 32px halo and median 21.
+    """
+    spatial = spatial_parameters(1.0) if spatial is None else spatial
     y, x = job
     height, width = gray.shape
-    y0, y1 = max(0, y - 32), min(height, y + 1056)
-    x0, x1 = max(0, x - 32), min(width, x + 1056)
+    halo = spatial["strong_halo"]
+    y0, y1 = max(0, y - halo), min(height, y + 1024 + halo)
+    x0, x1 = max(0, x - halo), min(width, x + 1024 + halo)
     patch = gray[y0:y1, x0:x1]
     f = patch.astype(np.float32)
-    reference = cv2.medianBlur(patch, 21).astype(np.float32)
-    fine = cv2.medianBlur(patch, 5).astype(np.float32)
+    reference = cv2.medianBlur(patch, spatial["strong_median"]).astype(np.float32)
+    fine = cv2.medianBlur(patch, spatial["strong_fine_median"]).astype(np.float32)
     delta = f - reference
     fine_delta = f - fine
     residual = np.maximum(delta, 0) if polarity == "light" else np.maximum(-delta, 0) if polarity == "dark" else np.abs(delta)
     # Median of residuals estimates local grain without reacting to isolated dust.
-    noise = cv2.medianBlur(np.clip(np.abs(fine_delta), 0, 255).astype(np.uint8), 9).astype(np.float32)
-    smooth = cv2.GaussianBlur(reference, (0, 0), 1.5)
+    noise = cv2.medianBlur(np.clip(np.abs(fine_delta), 0, 255).astype(np.uint8), spatial["strong_noise_median"]).astype(np.float32)
+    smooth = cv2.GaussianBlur(reference, (0, 0), spatial["strong_sigma"])
     gx = cv2.Sobel(smooth, cv2.CV_32F, 1, 0, ksize=3) / 8
     gy = cv2.Sobel(smooth, cv2.CV_32F, 0, 1, ksize=3) / 8
     edges = cv2.magnitude(gx, gy)
@@ -1015,12 +1268,13 @@ def _strong_dust_tile(job, gray, candidate, strength, sensitivity, polarity, thr
     # Texture and scene boundaries are intentionally left for manual marks.
     # The median reference suppresses dust itself so isolated specks do
     # not disqualify their own otherwise smooth background.
-    background = cv2.medianBlur(patch, 7).astype(np.float32)
+    background = cv2.medianBlur(patch, spatial["strong_scene_median"]).astype(np.float32)
     background = np.where(score > 1, reference, background)
-    mean = cv2.GaussianBlur(background, (0, 0), 7)
-    variance = cv2.GaussianBlur(background * background, (0, 0), 7) - mean * mean
+    mean = cv2.GaussianBlur(background, (0, 0), spatial["strong_variance_sigma"])
+    variance = cv2.GaussianBlur(background * background, (0, 0), spatial["strong_variance_sigma"]) - mean * mean
     texture = np.sqrt(np.maximum(variance, 0))
-    boundaries = cv2.dilate((edges > 2.5 + sensitivity * .055).astype(np.uint8), np.ones((7, 7), np.uint8))
+    boundary = spatial["strong_boundary"]
+    boundaries = cv2.dilate((edges > 2.5 + sensitivity * .055).astype(np.uint8), np.ones((boundary, boundary), np.uint8))
     marks = ((score > 1) & (texture < 4 + sensitivity * .08) & (boundaries == 0)).astype(np.uint8) * 255
     sy, sx = y - y0, x - x0
     hh, ww = min(1024, height - y), min(1024, width - x)
@@ -1028,26 +1282,32 @@ def _strong_dust_tile(job, gray, candidate, strength, sensitivity, polarity, thr
     strength[y:y + hh, x:x + ww] = score[sy:sy + hh, sx:sx + ww]
 
 
-def _fill_strong_dust_tiles(gray, candidate, strength, sensitivity, polarity, threshold):
+def _fill_strong_dust_tiles(gray, candidate, strength, sensitivity, polarity, threshold, spatial=None):
+    spatial = spatial_parameters(1.0) if spatial is None else spatial
     jobs = _tile_origins(*gray.shape)
 
     def tile(job):
-        _strong_dust_tile(job, gray, candidate, strength, sensitivity, polarity, threshold)
+        _strong_dust_tile(job, gray, candidate, strength, sensitivity, polarity, threshold, spatial)
 
     _run_tile_jobs(jobs, tile)
 
 
-def detect_dust(rgb, sensitivity=50, size=30, hairs=True, protect=True, polarity="both", *, capture=None):
+def detect_dust(rgb, sensitivity=50, size=30, hairs=True, protect=True, polarity="both", *, capture=None, spatial_scale=1.0):
     """Strong dust plus coherent faint defects; dense scene texture is protected.
 
     Do not erase candidate pixels before measuring background texture: doing so
     makes a tiled roof look flat. Texture occupancy over a wider neighborhood
     distinguishes repeating highlights from one isolated hair or dust blob.
-    Light-dust tiles (median kernel 31, 96px halo) and the strong-dust tiles
-    below run across cores. Each worker writes only its inner block.
+    Light-dust tiles (median kernel 31, 96px halo at full resolution) and the
+    strong-dust tiles below run across cores. Each worker writes only its inner
+    block. spatial_scale 1 keeps those kernels and pixel thresholds. A smaller
+    scale is the downscaled preview and must not reuse the full-resolution sizes.
     """
+    spatial = spatial_parameters(spatial_scale)
+    scale = spatial["scale"]
     sensitivity = float(np.clip(sensitivity, 1, 100))
-    size = int(np.clip(size, 4, 100))
+    full_size = int(np.clip(size, 4, 100))
+    size = scaled_dust_size(full_size, scale)
     if polarity not in ("both", "light", "dark"):
         raise ValueError("未知灰尘颜色设置。")
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
@@ -1055,12 +1315,13 @@ def detect_dust(rgb, sensitivity=50, size=30, hairs=True, protect=True, polarity
     extent = np.zeros_like(gray)
     scores = np.zeros(gray.shape, np.float32)
     scene = np.zeros_like(gray)
-    # 96px halo covers the wider texture neighborhood and avoids tile seams.
-    _fill_light_dust_tiles(gray, extent, scores, scene, sensitivity, polarity)
+    # The halo covers the wider texture neighborhood and avoids tile seams.
+    _fill_light_dust_tiles(gray, extent, scores, scene, sensitivity, polarity, spatial)
     if protect:
-        scene |= _frame_exclusion(gray)
+        scene |= _frame_exclusion(gray, scale)
         extent[scene > 0] = 0
-    extent = cv2.morphologyEx(extent, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    close = spatial["close_ellipse"]
+    extent = cv2.morphologyEx(extent, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close, close)))
     extent[scene > 0] = 0
     n, labels, stats, centroids = cv2.connectedComponentsWithStats(extent, 8)
     peaks = np.zeros(n, np.float32)
@@ -1069,7 +1330,7 @@ def detect_dust(rgb, sensitivity=50, size=30, hairs=True, protect=True, polarity
     centers = np.zeros(gray.shape, np.float32)
     for k in range(1, n):
         x, y, w, h, area = stats[k]
-        if peaks[k] < 1.6 or area < 8 or area > size * size * 8:
+        if peaks[k] < 1.6 or area < spatial["min_component_area"] or area > size * size * 8:
             continue
         local = (labels[y:y + h, x:x + w] == k).astype(np.uint8)
         mean_score = float(np.mean(scores[y:y + h, x:x + w][local > 0]))
@@ -1079,7 +1340,7 @@ def detect_dust(rgb, sensitivity=50, size=30, hairs=True, protect=True, polarity
         radius = cv2.distanceTransform(local, cv2.DIST_L2, 3).max()
         if length <= size * 2 and density > .1 and area < size * size * 2 and (hairs or max(w, h) / max(1, min(w, h)) < 3.8):
             keep[k] = 255
-        elif hairs and length <= min(1000, size * 30) and area / length < 18 and radius < 9:
+        elif hairs and length <= min(spatial["hair_length_cap"], size * 30) and area / length < spatial["hair_thickness"] and radius < spatial["hair_radius"]:
             yy, xx = np.nonzero(local)
             points = np.column_stack((xx, yy)).astype(np.float32)
             vx, vy, xm, ym = cv2.fitLine(points, cv2.DIST_L2, 0, .01, .01).ravel()
@@ -1090,71 +1351,86 @@ def detect_dust(rgb, sensitivity=50, size=30, hairs=True, protect=True, polarity
             branches = ((neighbors > 2) & (skeleton > 0)).astype(np.uint8)
             nbranches = cv2.connectedComponents(branches, 8)[0] - 1
             coherent = endpoints <= 6 and (nbranches <= 4 or (endpoints <= 4 and mean_score > 1.6))
-            if coherent and (length < 65 or bend > 1.5):
+            if coherent and (length < spatial["hair_short"] or bend > spatial["hair_bend"]):
                 keep[k] = 255
         if keep[k]:
             cx, cy = centroids[k]
             centers[int(cy), int(cx)] = 1
-    crowd = cv2.boxFilter(centers, -1, (121, 121), normalize=False)
+    crowd_box = spatial["crowd_box"]
+    crowd = cv2.boxFilter(centers, -1, (crowd_box, crowd_box), normalize=False)
     mask = keep[labels]
     mask[crowd > 7] = 0
-    strong = _detect_strong_dust(rgb, sensitivity, size, hairs, protect, polarity, capture)
+    strong = _detect_strong_dust(rgb, sensitivity, full_size, hairs, protect, polarity, capture, spatial_scale=scale)
     strong[scene > 0] = 0
     mask = np.maximum(mask, strong)
     # Separate a bright, thicker speck attached to a thin line, without selecting
     # the whole line (e.g. a flake immediately next to an antenna or scratch).
+    opened = spatial["core_open"]
     cores = cv2.morphologyEx(((scores > 2) & (scene == 0)).astype(np.uint8) * 255, cv2.MORPH_OPEN,
-                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (opened, opened)))
     nc, clabels, cstats, _ = cv2.connectedComponentsWithStats(cores, 8)
     ckeep = np.zeros(nc, np.uint8)
     for k in range(1, nc):
         x, y, w, h, area = cstats[k]
-        if area >= 4 and max(w, h) <= size * 2 and min(w, h) <= size and area / (w * h) > .25:
+        if area >= spatial["core_min_area"] and max(w, h) <= size * 2 and min(w, h) <= size and area / (w * h) > .25:
             ckeep[k] = 255
         elif max(w, h) > size * 2 and min(w, h) < size * 2:
             local = (clabels[y:y + h, x:x + w] == k).astype(np.uint8)
             distance = cv2.distanceTransform(local, cv2.DIST_L2, 3)
-            islands = (distance > max(3, float(distance.max()) * .65)).astype(np.uint8)
+            islands = (distance > max(spatial["core_distance"], float(distance.max()) * .65)).astype(np.uint8)
             ni, ilabels, istats, _ = cv2.connectedComponentsWithStats(islands, 8)
             ikeep = np.zeros(ni, np.uint8)
             for j in range(1, ni):
                 _, _, iw, ih, ia = istats[j]
-                if ia >= 3 and max(iw, ih) <= size * 2:
+                if ia >= spatial["core_island_area"] and max(iw, ih) <= size * 2:
                     ikeep[j] = 255
-            recovered = cv2.dilate(ikeep[ilabels], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+            recover = spatial["core_recover"]
+            recovered = cv2.dilate(ikeep[ilabels], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (recover, recover)))
             mask[y:y + h, x:x + w] = np.maximum(mask[y:y + h, x:x + w], recovered)
-    mask = np.maximum(mask, cv2.dilate(ckeep[clabels], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))))
-    mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    dot = spatial["core_dilate"]
+    mask = np.maximum(mask, cv2.dilate(ckeep[clabels], cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dot, dot))))
+    final = spatial["final_dilate"]
+    mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (final, final)))
     mask[scene > 0] = 0
     if capture is not None:
         capture["scores"] = scores
         capture["mask"] = mask
+        capture["size"] = int(size)
+        capture["light_median"] = int(spatial["light_median"])
+        capture["spatial_scale"] = float(scale)
     return mask
 
 
-def _detect_strong_dust(rgb, sensitivity=50, size=30, hairs=False, protect=True, polarity="both", capture=None):
-    """Multiscale residuals with texture/edge penalties, native-resolution tiles."""
+def _detect_strong_dust(rgb, sensitivity=50, size=30, hairs=False, protect=True, polarity="both", capture=None, *, spatial_scale=1.0):
+    """Multiscale residuals with texture/edge penalties, native-resolution tiles.
+
+    spatial_scale 1 keeps median 21 and the pixel thresholds. The preview path
+    passes the full-resolution size and the scale; this function scales once.
+    """
+    spatial = spatial_parameters(spatial_scale)
+    scale = spatial["scale"]
     sensitivity = float(np.clip(sensitivity, 1, 100))
-    size = int(np.clip(size, 4, 100))
+    size = scaled_dust_size(size, scale)
     if polarity not in ("both", "light", "dark"):
         raise ValueError("未知灰尘颜色设置。")
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     height, width = gray.shape
-    # No global resize: single-pixel marks stay visible.
+    # No global resize on the full-resolution path: single-pixel marks stay visible.
     candidate = np.zeros_like(gray)
     strength = np.zeros_like(gray, dtype=np.float32)
     threshold = 5 + (100 - sensitivity) * .18
-    # 32px halo is the serial neighborhood. Workers write disjoint 1024px blocks.
-    _fill_strong_dust_tiles(gray, candidate, strength, sensitivity, polarity, threshold)
+    # Halo is the serial neighborhood. Workers write disjoint 1024px blocks.
+    _fill_strong_dust_tiles(gray, candidate, strength, sensitivity, polarity, threshold, spatial)
     if protect:
         # Exclude dark film surround and the picture/frame seam, plus outer 1.5%.
         dark = (gray < 24).astype(np.uint8)
         _, labels, stats, _ = cv2.connectedComponentsWithStats(dark, 8)
         border_ids = np.unique(np.concatenate((labels[0], labels[-1], labels[:, 0], labels[:, -1])))
-        border_ids = border_ids[(border_ids > 0) & (stats[border_ids, cv2.CC_STAT_AREA] > 64)]
+        border_ids = border_ids[(border_ids > 0) & (stats[border_ids, cv2.CC_STAT_AREA] > spatial["frame_area"])]
         excluded = np.isin(labels, border_ids).astype(np.uint8)
-        excluded = cv2.dilate(excluded, np.ones((17, 17), np.uint8))
-        margin = max(2, round(min(height, width) * .015))
+        frame = spatial["frame_dilate"]
+        excluded = cv2.dilate(excluded, np.ones((frame, frame), np.uint8))
+        margin = max(spatial["frame_margin"], round(min(height, width) * .015))
         excluded[:margin] = 1
         excluded[-margin:] = 1
         excluded[:, :margin] = 1
@@ -1164,19 +1440,20 @@ def _detect_strong_dust(rgb, sensitivity=50, size=30, hairs=False, protect=True,
     keep = np.zeros(n, dtype=np.uint8)
     for k in range(1, n):
         x, y, w, h, area = stats[k]
-        if area < 4 or area > size * size:
+        if area < spatial["strong_min_area"] or area > size * size:
             continue
         aspect = max(w, h) / max(1, min(w, h))
         density = area / (w * h)
         if max(w, h) <= size and aspect < 3.8 and density > .13:
             keep[k] = 255
-        elif hairs and max(w, h) <= size * 6 and area / max(w, h) < 7 and density < .60:
+        elif hairs and max(w, h) <= size * 6 and area / max(w, h) < spatial["strong_thickness"] and density < .60:
             # Long thin candidates remain opt-in because wires/hair can look identical.
             local = (labels[y:y + h, x:x + w] == k)
             if np.mean(strength[y:y + h, x:x + w][local]) > 1.35:
                 keep[k] = 255
     mask = keep[labels]
-    mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    dilate = spatial["strong_dilate"]
+    mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate, dilate)))
     if protect:
         mask[excluded > 0] = 0
     if capture is not None:
@@ -1387,7 +1664,7 @@ def png_bytes(array):
     return out.getvalue()
 
 
-def downscale(array, max_edge):
+def downscale(array, max_edge, interpolation=cv2.INTER_AREA):
     """Shrink so the long edge is at most max_edge. Area sampling keeps thin marks."""
     height, width = array.shape[:2]
     long_edge = max(height, width)
@@ -1395,7 +1672,7 @@ def downscale(array, max_edge):
         return array
     scale = max_edge / long_edge
     size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
-    return cv2.resize(array, size, interpolation=cv2.INTER_AREA)
+    return cv2.resize(array, size, interpolation=interpolation)
 
 
 def lossy_preview_bytes(array, detailed=False):
