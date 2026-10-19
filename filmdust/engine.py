@@ -14,6 +14,82 @@ from PIL import Image, ImageCms, ImageOps
 MAX_PIXELS = 100_000_000
 # Longest edge of the first comparison. Full-frame previews replace it later.
 QUICK_PREVIEW_EDGE = 2048
+# Undo keeps changed rectangles, not another full frame. The cap is the
+# retained patch bytes; a step is never dropped if it is the only one.
+UNDO_BYTE_BUDGET = 256 * 1024 * 1024
+UNDO_STEP_LIMIT = 12
+_PATCH_TILE = 128
+
+
+def _change_mask(before_result, after_result, before_mask, after_mask, before_pending, after_pending):
+    """Pixels whose stored result, selection, or held candidate changed."""
+    height, width = before_mask.shape
+    changed = np.zeros((height, width), np.uint8)
+    for y in range(0, height, 2048):
+        y1 = min(height, y + 2048)
+        for x in range(0, width, 2048):
+            x1 = min(width, x + 2048)
+            sl = np.s_[y:y1, x:x1]
+            local = before_mask[sl] != after_mask[sl]
+            local |= before_pending[sl] != after_pending[sl]
+            if before_result is not after_result:
+                before = before_result[sl]
+                after = after_result[sl]
+                local |= before != after if before.ndim == 2 else np.any(before != after, axis=-1)
+            if local.any():
+                changed[sl] = local
+    return changed
+
+
+def _change_boxes(changed, tile=_PATCH_TILE):
+    """Tight boxes inside fixed tiles. Scattered dust does not become one full-frame box."""
+    height, width = changed.shape
+    boxes = []
+    for y in range(0, height, tile):
+        y1 = min(height, y + tile)
+        row = changed[y:y1]
+        if not row.any():
+            continue
+        for x in range(0, width, tile):
+            x1 = min(width, x + tile)
+            block = row[:, x:x1]
+            if not block.any():
+                continue
+            ys, xs = np.nonzero(block)
+            boxes.append((y + int(ys.min()), x + int(xs.min()), int(ys.max() - ys.min()) + 1, int(xs.max() - xs.min()) + 1))
+    return boxes
+
+
+def _entry_bytes(entry):
+    """Bytes retained for one undo or redo step."""
+    total = 0
+    if entry.get("sealed"):
+        for patch in entry.get("patches", []):
+            for key in ("result", "mask", "pending"):
+                array = patch.get(key)
+                if isinstance(array, np.ndarray):
+                    total += int(array.nbytes)
+    else:
+        for key in ("result", "mask", "pending_mask"):
+            array = entry.get(key)
+            if isinstance(array, np.ndarray):
+                total += int(array.nbytes)
+    seen = set()
+    for stroke in entry.get("clone_strokes") or []:
+        mask = stroke.get("mask") if isinstance(stroke, dict) else None
+        if isinstance(mask, np.ndarray) and id(mask) not in seen:
+            seen.add(id(mask))
+            total += int(mask.nbytes)
+    return total
+
+
+def _trim_stack(stack, budget=None, limit=None):
+    budget = UNDO_BYTE_BUDGET if budget is None else budget
+    limit = UNDO_STEP_LIMIT if limit is None else limit
+    while len(stack) > limit:
+        stack.pop(0)
+    while len(stack) > 1 and sum(_entry_bytes(entry) for entry in stack) > budget:
+        stack.pop(0)
 
 
 class Photo:
@@ -101,6 +177,7 @@ class Photo:
         self.pending_mask = np.zeros_like(self.mask)
         self.detection_report = None
         self.history = []
+        self._redo = []
         self.clone_strokes = []
         # Original pixel scans remain valid when selection/repair edits change.
         # RAM only, scoped to this imported photo; never written to disk.
@@ -177,10 +254,11 @@ class Photo:
     def transaction(self):
         """An edit and its repair are one operation, including undo on failure."""
         saved = {key: getattr(self, key) for key in (
-            "mask", "pending_mask", "detection_report", "history", "clone_strokes",
+            "mask", "pending_mask", "detection_report", "history", "_redo", "clone_strokes",
             "revision", "healed_revision", "result", "heal_report", "preview_patch", "edit_report")}
         self.mask = self.mask.copy()
         self.history = list(self.history)
+        self._redo = list(self._redo)
         try:
             yield
             self.heal()
@@ -209,16 +287,95 @@ class Photo:
         return result
 
     def checkpoint(self):
-        # Pixel snapshots are immutable. Local edits copy the result once, never
-        # replay thousands of automatic repairs, and undo restores exact pixels.
+        # A new edit invalidates redo. The previous step is stored as patches
+        # once its repaired pixels exist; this call only keeps full frames while
+        # the edit is still building the next result.
+        self._redo = []
+        current = self.heal()
+        if self.history and not self.history[-1].get("sealed"):
+            self._seal_entry(self.history[-1])
         self.history.append(dict(mask=self.mask.copy(), clone_strokes=list(self.clone_strokes),
-                                 pending_mask=self.pending_mask, detection_report=self.detection_report,
-                                 result=self.heal(), heal_report=self.heal_report,
-                                 revision=self.revision, edit_report=self.edit_report, bounds=None))
-        # Bound retained document states, but keep at least the previous state.
-        per_state = self.original.nbytes + 2 * self.mask.nbytes
-        max_history = max(1, min(12, (256 * 1024 * 1024) // per_state))
-        self.history = self.history[-max_history:]
+                                 pending_mask=self.pending_mask.copy(), detection_report=self.detection_report,
+                                 result=current, heal_report=self.heal_report,
+                                 revision=self.revision, edit_report=self.edit_report, bounds=None, sealed=False))
+
+    def _seal_entry(self, entry):
+        """Replace this step's full frames with the rectangles that actually differ."""
+        if entry.get("sealed"):
+            return
+        if self.result is None or entry.get("result") is None:
+            return
+        changed = _change_mask(entry["result"], self.result, entry["mask"], self.mask, entry["pending_mask"], self.pending_mask)
+        patches = []
+        for y, x, h, w in _change_boxes(changed):
+            sl = np.s_[y:y + h, x:x + w]
+            patch = {"y": int(y), "x": int(x), "h": int(h), "w": int(w)}
+            if entry["result"] is not self.result and np.any(entry["result"][sl] != self.result[sl]):
+                patch["result"] = entry["result"][sl].copy()
+            if np.any(entry["mask"][sl] != self.mask[sl]):
+                patch["mask"] = entry["mask"][sl].copy()
+            if np.any(entry["pending_mask"][sl] != self.pending_mask[sl]):
+                patch["pending"] = entry["pending_mask"][sl].copy()
+            patches.append(patch)
+        entry["patches"] = patches
+        entry["sealed"] = True
+        for key in ("result", "mask", "pending_mask"):
+            entry.pop(key, None)
+        if self.history and self.history[-1] is entry:
+            _trim_stack(self.history)
+
+    def _seal_latest(self):
+        if self.history and self.result is not None and self.healed_revision == self.revision:
+            self._seal_entry(self.history[-1])
+
+    def undo_step_bytes(self):
+        """Retained bytes of each undo step, oldest first. Patch steps exclude full frames."""
+        return [_entry_bytes(entry) for entry in self.history]
+
+    def _exchange_patches(self, patches):
+        # Copy the live pixels first so a later failure still has them, then write.
+        inverse = []
+        regions = []
+        for patch in patches:
+            y, x, h, w = patch["y"], patch["x"], patch["h"], patch["w"]
+            sl = np.s_[y:y + h, x:x + w]
+            saved = {"y": y, "x": x, "h": h, "w": w}
+            if "result" in patch:
+                saved["result"] = self.result[sl].copy()
+            if "mask" in patch:
+                saved["mask"] = self.mask[sl].copy()
+            if "pending" in patch:
+                saved["pending"] = self.pending_mask[sl].copy()
+            inverse.append(saved)
+            regions.append(sl)
+        for patch, sl in zip(patches, regions):
+            if "result" in patch:
+                self.result[sl] = patch["result"]
+            if "mask" in patch:
+                self.mask[sl] = patch["mask"]
+            if "pending" in patch:
+                self.pending_mask[sl] = patch["pending"]
+        return inverse
+
+    def _apply_entry(self, entry):
+        """Swap this step's stored pixels into the live photo. Returns the inverse step."""
+        previous_revision = self.revision
+        if self.result is None or self.healed_revision != self.revision:
+            self.heal()
+        if not entry.get("sealed"):
+            self._seal_entry(entry)
+        inverse = dict(sealed=True, patches=self._exchange_patches(entry.get("patches", [])),
+                       clone_strokes=self.clone_strokes, detection_report=self.detection_report,
+                       heal_report=self.heal_report, edit_report=self.edit_report, bounds=entry.get("bounds"))
+        self.clone_strokes = entry["clone_strokes"]
+        self.detection_report = entry["detection_report"]
+        self.heal_report = entry["heal_report"]
+        self.edit_report = entry["edit_report"]
+        self.revision = previous_revision + 1
+        self.healed_revision = self.revision
+        bounds = entry.get("bounds")
+        self.preview_patch = None if bounds is None else dict(from_revision=previous_revision, bounds=list(bounds))
+        return inverse
 
     def changed(self):
         self.revision += 1
@@ -294,6 +451,7 @@ class Photo:
         self.edit_report = dict(kind=kind, changed_pixels=pixels)
         self.heal_report = report
         self.healed_revision = self.revision
+        self._seal_latest()
 
     def display(self, pixels):
         pixels = self.straight_pixels(pixels)
@@ -355,7 +513,7 @@ class Photo:
             j = np.argmin((xx - w / 2) ** 2 + (yy - h / 2) ** 2)
             changes.append(dict(point=[int(x + xx[j]), int(y + yy[j])], kind="processed"))
         return dict(name=self.name, width=self.width, height=self.height, depth=self.depth,
-                    gray=self.gray, revision=self.revision, undo=bool(self.history),
+                    gray=self.gray, revision=self.revision, undo=bool(self.history), redo=bool(self._redo),
                     count=max(0, n - 1), pixels=selected,
                     percent=round(selected * 100 / self.mask.size, 4), notes=self.notes,
                     profile="原色彩配置已保留" if self.icc else "原图未嵌入色彩配置",
@@ -388,6 +546,7 @@ class Photo:
         self.heal_report = healing
         self.result = result
         self.healed_revision = self.revision
+        self._seal_latest()
 
     def detect(self, sensitivity=50, size=30, hairs=True, protect=True, polarity="both"):
         key = (float(sensitivity), int(size), bool(hairs), bool(protect), polarity)
@@ -549,15 +708,18 @@ class Photo:
         self.finish_local_edit("restore")
 
     def undo(self):
-        if self.history:
-            previous_revision = self.revision
-            saved = self.history.pop()
-            self.changed()
-            for key in ('mask', 'clone_strokes', 'pending_mask', 'detection_report', 'result', 'heal_report', 'edit_report'):
-                setattr(self, key, saved[key])
-            self.healed_revision = self.revision
-            if saved['bounds'] is not None:
-                self.preview_patch = dict(from_revision=previous_revision, bounds=saved['bounds'])
+        if not self.history:
+            return
+        entry = self.history.pop()
+        self._redo.append(self._apply_entry(entry))
+        _trim_stack(self._redo)
+
+    def redo(self):
+        if not self._redo:
+            return
+        entry = self._redo.pop()
+        self.history.append(self._apply_entry(entry))
+        _trim_stack(self.history)
 
     def clear(self):
         self.checkpoint()

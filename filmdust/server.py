@@ -92,7 +92,7 @@ class Handler(BaseHTTPRequestHandler):
                     data = data.replace(b"__TOKEN__", TOKEN.encode())
                 self.send(data, mime=mime)
             elif u.path == "/api/health":
-                self.send({"ok": True, "local": True, "version": "1.8.3", "ai": False, "automatic": True})
+                self.send({"ok": True, "local": True, "version": "1.8.4", "ai": False, "automatic": True})
             elif u.path == "/api/image":
                 # Session lookup is global. Original bytes are immutable and can be
                 # served while detect holds the photo lock. Result and overlay need
@@ -206,6 +206,8 @@ class Handler(BaseHTTPRequestHandler):
                             photo.keep_regions(body.get("points", []))
                         elif u.path == "/api/undo":
                             photo.undo()
+                        elif u.path == "/api/redo":
+                            photo.redo()
                         elif u.path == "/api/clear":
                             photo.clear()
                         elif u.path == "/api/heal":
