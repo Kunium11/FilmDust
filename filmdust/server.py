@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from engine import Photo, png_bytes
+from engine import Photo
 
 ROOT = Path(__file__).resolve().parent
 TOKEN = secrets.token_urlsafe(32)
@@ -23,6 +23,36 @@ SESSIONS = OrderedDict()
 ACTIVE_ID = None
 GLOBAL_LOCK = threading.RLock()
 MAX_UPLOAD = 200 * 1024 * 1024
+
+
+def preview_max_edge(query):
+    if "max" not in query:
+        return None
+    try:
+        value = int(query["max"][0])
+    except (TypeError, ValueError):
+        raise ValueError("预览尺寸无效。")
+    if value < 32 or value > 16384:
+        raise ValueError("预览尺寸无效。")
+    return value
+
+
+def preview_rect(query, photo):
+    x, y, w, h = 0, 0, photo.width, photo.height
+    if "rect" not in query:
+        return x, y, w, h
+    try:
+        values = [int(v) for v in query["rect"][0].split(",")]
+    except (TypeError, ValueError):
+        raise ValueError("预览范围无效。")
+    if len(values) != 4:
+        raise ValueError("预览范围无效。")
+    x, y, w, h = values
+    if x < 0 or y < 0 or w < 1 or h < 1 or x + w > photo.width or y + h > photo.height:
+        raise ValueError("预览范围超出照片。")
+    return x, y, w, h
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         if args and str(args[0]).startswith("GET /api/image"):
@@ -62,37 +92,32 @@ class Handler(BaseHTTPRequestHandler):
                     data = data.replace(b"__TOKEN__", TOKEN.encode())
                 self.send(data, mime=mime)
             elif u.path == "/api/health":
-                self.send({"ok": True, "local": True, "version": "1.8.2", "ai": False, "automatic": True})
+                self.send({"ok": True, "local": True, "version": "1.8.3", "ai": False, "automatic": True})
             elif u.path == "/api/image":
+                # Session lookup is global. Original bytes are immutable and can be
+                # served while detect holds the photo lock. Result and overlay need
+                # that lock so a stale revision cannot be encoded mid-edit.
                 with GLOBAL_LOCK:
                     photo = SESSIONS.get(query.get("id", [""])[0])
                     if photo is None:
                         raise ValueError("照片已关闭，请重新导入。")
                     kind = query.get("kind", ["original"])[0]
-                    if kind != "original" and str(photo.revision) != query.get("v", [""])[0]:
-                        raise ValueError("照片已更新，请重新加载预览。")
-                    x, y, w, h = 0, 0, photo.width, photo.height
-                    if "rect" in query:
-                        values = [int(v) for v in query['rect'][0].split(',')]
-                        if len(values) != 4:
-                            raise ValueError("预览范围无效。")
-                        x, y, w, h = values
-                        if x < 0 or y < 0 or w < 1 or h < 1 or x + w > photo.width or y + h > photo.height:
-                            raise ValueError("预览范围超出照片。")
-                    region = np.s_[y:y + h, x:x + w]
-                    if kind == "mask":
-                        self.send(png_bytes(photo.mask[region]), mime="image/png")
-                    elif kind == "overlay":
-                        overlay = np.zeros((h, w, 4), np.uint8)
-                        overlay[photo.pending_mask[region] > 0] = [242, 195, 79, 180]
-                        overlay[photo.mask[region] > 0] = [244, 91, 66, 155]
-                        self.send(png_bytes(overlay), mime="image/png")
-                    elif kind == "original":
-                        self.send(png_bytes(photo.preview[region]), mime="image/png")
-                    elif kind == "result":
-                        self.send(png_bytes(photo.display(photo.heal()[region])), mime="image/png")
-                    else:
-                        raise ValueError("未知预览类型。")
+                    max_edge = preview_max_edge(query)
+                    revision = query.get("v", [""])[0]
+                if kind == "original":
+                    # Original pixels do not change with revision. Keep serving them
+                    # during detect; rect limits are unchanged.
+                    x, y, w, h = preview_rect(query, photo)
+                    data, mime = photo.render_preview(kind, np.s_[y:y + h, x:x + w], max_edge, x == 0 and y == 0 and w == photo.width and h == photo.height)
+                    self.send(data, mime=mime)
+                else:
+                    with photo.lock:
+                        if str(photo.revision) != revision:
+                            raise ValueError("照片已更新，请重新加载预览。")
+                        x, y, w, h = preview_rect(query, photo)
+                        full = x == 0 and y == 0 and w == photo.width and h == photo.height
+                        data, mime = photo.render_preview(kind, np.s_[y:y + h, x:x + w], max_edge, full)
+                    self.send(data, mime=mime)
             else:
                 self.send({"error": "页面不存在。"}, 404)
         except ValueError as e:
@@ -141,23 +166,30 @@ class Handler(BaseHTTPRequestHandler):
                 photo = SESSIONS.get(body.get("id"))
                 if photo is None:
                     raise ValueError("照片已关闭，请重新导入。")
-                if u.path == "/api/activate":
-                    ACTIVE_ID = body["id"]
-                elif u.path == "/api/release":
+                if u.path == "/api/release":
                     del SESSIONS[body["id"]]
                     if ACTIVE_ID == body["id"]:
                         ACTIVE_ID = None
                     self.send({"ok": True})
                     return
-                elif u.path == "/api/info":
-                    pass
-                elif u.path == "/api/export":
+                if u.path == "/api/activate":
+                    ACTIVE_ID = body["id"]
+            # Detect and export stay off the session lock so a low-resolution
+            # original can be shown while this photo is still processing.
+            # Lock order is session lock, then photo lock. Never the reverse.
+            with photo.lock:
+                if u.path == "/api/export":
                     if body.get("revision") != photo.revision:
                         raise ValueError("预览已过期，请先重新加载处理结果再保存。")
                     data, mime, suffix = photo.export(body.get("format", "tiff"))
                     name = Path(photo.name).stem + "_除尘" + suffix
-                    self.send(data, mime=mime, headers={"Content-Disposition": "attachment; filename*=UTF-8''" + urllib.parse.quote(name)})
-                    return
+                    payload = data
+                    mime_out = mime
+                    headers = {"Content-Disposition": "attachment; filename*=UTF-8''" + urllib.parse.quote(name)}
+                    info = None
+                elif u.path in ("/api/info", "/api/activate"):
+                    payload = mime_out = headers = None
+                    info = photo.info()
                 else:
                     if body.get("revision") is not None and body["revision"] != photo.revision:
                         raise ValueError("照片已更新，请先重新加载预览。")
@@ -180,7 +212,12 @@ class Handler(BaseHTTPRequestHandler):
                             photo.heal()
                         else:
                             raise ValueError("操作不存在。")
-                self.send(photo.info())
+                    payload = mime_out = headers = None
+                    info = photo.info()
+            if info is None:
+                self.send(payload, mime=mime_out, headers=headers)
+            else:
+                self.send(info)
         except (ValueError, TypeError, KeyError) as e:
             self.send({"error": str(e)}, 400)
         except (BrokenPipeError, ConnectionResetError):
