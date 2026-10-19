@@ -2,6 +2,7 @@
 import io
 import math
 from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
 
 import cv2
@@ -18,6 +19,7 @@ class Photo:
         self.icc = None
         self.dpi = (300, 300)
         self.notes = []
+        self.associated_alpha = False
         if data[:4] in (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+"):
             with tifffile.TiffFile(io.BytesIO(data)) as tf:
                 if len(tf.pages) != 1:
@@ -33,7 +35,15 @@ class Photo:
                 if pixels.dtype not in (np.dtype("uint8"), np.dtype("uint16")):
                     raise ValueError("请使用 8 位或 16 位整数 TIFF。")
                 if page.photometric.name == "MINISWHITE":
-                    pixels = np.iinfo(pixels.dtype).max - pixels
+                    pixels = pixels.copy()
+                    if pixels.ndim == 2:
+                        pixels = np.iinfo(pixels.dtype).max - pixels
+                    else:
+                        pixels[:, :, 0] = np.iinfo(pixels.dtype).max - pixels[:, :, 0]
+                if page.extrasamples:
+                    if len(page.extrasamples) != 1 or page.extrasamples[0].name not in ("ASSOCALPHA", "UNASSALPHA"):
+                        raise ValueError("暂不支持此 TIFF 附加通道，请导出 RGB 或标准透明度 TIFF。")
+                    self.associated_alpha = page.extrasamples[0].name == "ASSOCALPHA"
                 if "InterColorProfile" in page.tags:
                     self.icc = bytes(page.tags["InterColorProfile"].value)
                 orientation = page.tags.get("Orientation")
@@ -52,7 +62,16 @@ class Photo:
                     raise ValueError("暂不支持动图，请使用单张照片。")
                 self.icc = im.info.get("icc_profile")
                 self.dpi = im.info.get("dpi", (300, 300))
-                if im.mode in ("I", "I;16", "I;16B", "I;16L"):
+                if data[:8] == b"\x89PNG\r\n\x1a\n" and data[24] == 16:
+                    # Pillow reduces multi-channel 16-bit PNGs to 8 bits.
+                    pixels = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
+                    if pixels is None or pixels.dtype != np.uint16:
+                        raise ValueError("无法完整读取此 16 位 PNG，请使用 TIFF。")
+                    if pixels.ndim == 3:
+                        color_type = data[25]
+                        pixels = pixels[:, :, [0, 3]] if color_type == 4 else pixels[:, :, [2, 1, 0, 3]] if pixels.shape[2] == 4 else pixels[:, :, ::-1]
+                    pixels = orient_array(pixels, im.getexif().get(274, 1))
+                elif im.mode in ("I", "I;16", "I;16B", "I;16L"):
                     pixels = np.asarray(ImageOps.exif_transpose(im))
                     if np.min(pixels) < 0 or np.max(pixels) > 65535:
                         raise ValueError("灰度数值超出 16 位范围。")
@@ -88,20 +107,133 @@ class Photo:
         self.healed_revision = -1
         self.result = None
         self.preview = self.display(self.original)
+        self.preview_patch = None
+        self.edit_report = None
+
+    @contextmanager
+    def transaction(self):
+        """An edit and its repair are one operation, including undo on failure."""
+        saved = {key: getattr(self, key) for key in (
+            "mask", "pending_mask", "detection_report", "history", "clone_strokes",
+            "revision", "healed_revision", "result", "heal_report", "preview_patch", "edit_report")}
+        self.mask = self.mask.copy()
+        self.history = list(self.history)
+        try:
+            yield
+            self.heal()
+        except Exception:
+            for key, value in saved.items():
+                setattr(self, key, value)
+            raise
+
+    def straight_pixels(self, pixels):
+        if not self.associated_alpha:
+            return pixels
+        result = pixels.copy()
+        maximum = np.iinfo(pixels.dtype).max
+        alpha = pixels[:, :, -1:].astype(np.float32)
+        result[:, :, :-1] = np.clip(np.round(pixels[:, :, :-1].astype(np.float32) * maximum / np.maximum(alpha, 1)), 0, maximum).astype(pixels.dtype)
+        return result
+
+    def repair(self, mask, report):
+        result = heal_mask(self.straight_pixels(self.original), mask, self.gray, report)
+        if self.associated_alpha:
+            selected = mask > 0
+            maximum = np.iinfo(result.dtype).max
+            values = np.round(result[selected, :-1].astype(np.float32) * self.alpha[selected, None] / maximum).astype(result.dtype)
+            result = self.original.copy()
+            result[selected, :-1] = values
+        return result
 
     def checkpoint(self):
-        # Pending masks/reports are immutable snapshots; edits use copy-on-write.
-        self.history.append((self.mask.copy(), list(self.clone_strokes), self.pending_mask, self.detection_report))
-        # At most 64 MiB of undo masks, always keep at least one.
-        max_history = max(1, min(12, (64 * 1024 * 1024) // self.mask.nbytes))
+        # Pixel snapshots are immutable. Local edits copy the result once, never
+        # replay thousands of automatic repairs, and undo restores exact pixels.
+        self.history.append(dict(mask=self.mask.copy(), clone_strokes=list(self.clone_strokes),
+                                 pending_mask=self.pending_mask, detection_report=self.detection_report,
+                                 result=self.heal(), heal_report=self.heal_report,
+                                 revision=self.revision, edit_report=self.edit_report, bounds=None))
+        # Bound retained document states, but keep at least the previous state.
+        per_state = self.original.nbytes + 2 * self.mask.nbytes
+        max_history = max(1, min(12, (256 * 1024 * 1024) // per_state))
         self.history = self.history[-max_history:]
 
     def changed(self):
         self.revision += 1
         self.result = None
         self.heal_report = None
+        self.preview_patch = None
+        self.edit_report = None
+
+    def finish_local_edit(self, kind, paint=None, clone=None):
+        """Apply only this explicit user action to the last displayed pixels."""
+        before = self.history[-1]
+        if np.count_nonzero(self.mask) / self.mask.size > .15:
+            raise ValueError("选区超过照片的 15%，请先减少选区；此工具适合小灰尘和细丝。")
+        changed = cv2.bitwise_or(cv2.absdiff(self.mask, before['mask']),
+                                 cv2.absdiff(self.pending_mask, before['pending_mask']))
+        if paint is not None:
+            changed = cv2.bitwise_or(changed, paint)
+        x, y, w, h = cv2.boundingRect(changed)
+        self.result = before['result'].copy() if w and h else before['result']
+        report = dict(before['heal_report'] or dict(local=0, edge=0, donor=0, pending=[]))
+        pending = []
+        for px, py in report.get('pending', []):
+            px, py = int(np.clip(px, 0, self.width - 1)), int(np.clip(py, 0, self.height - 1))
+            if not before['mask'][py, px]:
+                x0, y0 = max(0, px - 32), max(0, py - 32)
+                yy, xx = np.nonzero(before['mask'][y0:py + 33, x0:px + 33])
+                if not len(xx):
+                    continue
+                j = np.argmin((xx + x0 - px) ** 2 + (yy + y0 - py) ** 2)
+                px, py = int(xx[j] + x0), int(yy[j] + y0)
+            if self.mask[py, px] and (paint is None or not paint[py, px]):
+                pending.append([px, py])
+        report['pending'] = pending
+        if w and h:
+            box = np.s_[y:y + h, x:x + w]
+            removed = (before['mask'][box] > 0) & (self.mask[box] == 0)
+            self.result[box][removed] = self.original[box][removed]
+            if paint is not None and clone is None and np.any(paint):
+                # Include clean surrounding pixels for interpolation, while
+                # committing exclusively the user-confirmed component/stroke.
+                pad = 64
+                x0, y0 = max(0, x - pad), max(0, y - pad)
+                x1, y1 = min(self.width, x + w + pad), min(self.height, y + h + pad)
+                region = np.s_[y0:y1, x0:x1]
+                mask = paint[region]
+                local_report = {}
+                source = self.straight_pixels(self.result[region])
+                healed = heal_mask(source, mask, self.gray, local_report, manual=True)
+                selected = mask > 0
+                if self.associated_alpha:
+                    maximum = np.iinfo(healed.dtype).max
+                    healed[:, :, :-1] = np.round(healed[:, :, :-1].astype(np.float32) * healed[:, :, -1:] / maximum).astype(healed.dtype)
+                self.result[region][selected] = healed[selected]
+                for key in ('local', 'edge', 'donor', 'manual_fallback'):
+                    report[key] = report.get(key, 0) + local_report.get(key, 0)
+            if clone is not None:
+                yy, xx = np.nonzero(clone['mask'])
+                xx, yy = xx + clone['x0'], yy + clone['y0']
+                self.result[yy, xx] = self.original[yy + clone['dy'], xx + clone['dx']]
+                if self.alpha is not None:
+                    if self.associated_alpha:
+                        donor_alpha = self.alpha[yy + clone['dy'], xx + clone['dx']].astype(np.float32)
+                        values = self.result[yy, xx, :-1].astype(np.float32) * self.alpha[yy, xx, None] / np.maximum(donor_alpha[:, None], 1)
+                        self.result[yy, xx, :-1] = np.minimum(np.round(values), self.alpha[yy, xx, None]).astype(self.original.dtype)
+                    self.result[yy, xx, -1] = self.alpha[yy, xx]
+            delta = self.result[box] != before['result'][box]
+            pixels = int(np.count_nonzero(np.any(delta, axis=2) if delta.ndim == 3 else delta))
+        else:
+            pixels = 0
+        bounds = [int(x), int(y), int(w), int(h)]
+        before['bounds'] = bounds
+        self.preview_patch = dict(from_revision=before['revision'], bounds=bounds)
+        self.edit_report = dict(kind=kind, changed_pixels=pixels)
+        self.heal_report = report
+        self.healed_revision = self.revision
 
     def display(self, pixels):
+        pixels = self.straight_pixels(pixels)
         small = (pixels // 257).astype(np.uint8) if pixels.dtype == np.uint16 else pixels
         if self.gray:
             gray = small if small.ndim == 2 else small[:, :, 0]
@@ -151,19 +283,28 @@ class Photo:
             nearest = np.argmin((xx + x - px) ** 2 + (yy + y - py) ** 2)
             reviews.append(dict(point=[int(xx[nearest] + x), int(yy[nearest] + y)], kind="repair"))
         repaired = max(0, n - 1 - len(repair_ids)) if self.heal_report is not None else 0
+        changes = []
+        for k in range(1, n):
+            if k in repair_ids:
+                continue
+            x, y, w, h, _ = stats[k]
+            yy, xx = np.nonzero(labels[y:y + h, x:x + w] == k)
+            j = np.argmin((xx - w / 2) ** 2 + (yy - h / 2) ** 2)
+            changes.append(dict(point=[int(x + xx[j]), int(y + yy[j])], kind="processed"))
         return dict(name=self.name, width=self.width, height=self.height, depth=self.depth,
                     gray=self.gray, revision=self.revision, undo=bool(self.history),
                     count=max(0, n - 1), pixels=selected,
                     percent=round(selected * 100 / self.mask.size, 4), notes=self.notes,
                     profile="原色彩配置已保留" if self.icc else "原图未嵌入色彩配置",
                     healing=self.heal_report, pending_count=int(pending_count), pending_points=pending_points, detection=self.detection_report,
-                    processed_count=int(repaired), reviews=reviews)
+                    processed_count=int(repaired), reviews=reviews, changes=changes,
+                    preview_patch=self.preview_patch, edit=self.edit_report)
 
     def process(self, level="gentle", options=None):
-        if level not in ("gentle", "standard", "more"):
+        if level not in ("auto", "gentle", "standard", "more"):
             raise ValueError("无法识别去除程度。")
         options = options or {}
-        sensitivity = options.get("sensitivity", {"gentle":40, "standard":50, "more":65}[level])
+        sensitivity = options.get("sensitivity", {"auto":70, "gentle":40, "standard":50, "more":65}[level])
         key = (float(sensitivity), int(options.get("size", 30)), bool(options.get("hairs", True)),
                bool(options.get("protect", True)), options.get("polarity", "light"))
         proposal = self.proposal_cache.get(key)
@@ -179,7 +320,7 @@ class Photo:
         summary.update(level=level, sensitivity=float(sensitivity), size=key[1], automatic=True, custom=bool(options),
                        settings=dict(sensitivity=key[0], size=key[1], hairs=key[2], protect=key[3], polarity=key[4]))
         healing = {}
-        result = heal_mask(self.original, selected, self.gray, healing)
+        result = self.repair(selected, healing)
         self.install_detection(selected, pending, summary)
         self.heal_report = healing
         self.result = result
@@ -220,18 +361,28 @@ class Photo:
             coords.append((int(np.clip(x, 0, self.width - 1)), int(np.clip(y, 0, self.height - 1))))
         self.checkpoint()
         radius = max(1, min(250, round(float(diameter) / 2)))
-        # Clicking an uncertain yellow component accepts the whole component;
-        # dragging still paints normally. Never mutate a history snapshot.
-        if mode == "add" and len(coords) == 1:
-            x, y = coords[0]
-            if self.pending_mask[y, x]:
-                remaining = self.pending_mask.copy()
-                cv2.floodFill(remaining, None, (x, y), 0)
-                accepted = (self.pending_mask > 0) & (remaining == 0)
-                self.mask[accepted] = 255
-                self.pending_mask = remaining
-                self.changed()
-                return
+        if mode == "add":
+            paint = np.zeros_like(self.mask)
+            for point in coords:
+                cv2.circle(paint, point, radius, 255, -1)
+            for p, q in zip(coords, coords[1:]):
+                cv2.line(paint, p, q, 255, radius * 2)
+            # Touching an existing candidate confirms its whole connected defect,
+            # including a defect that the automatic repair had left unchanged.
+            union = cv2.bitwise_or(self.mask, self.pending_mask)
+            remaining = union.copy()
+            yy, xx = np.nonzero(cv2.bitwise_and(union, paint))
+            for x, y in zip(xx, yy):
+                if remaining[y, x]:
+                    cv2.floodFill(remaining, None, (int(x), int(y)), 0)
+            paint = cv2.bitwise_or(paint, cv2.subtract(union, remaining))
+            if self.alpha is not None:
+                paint[self.alpha == 0] = 0
+            self.mask = cv2.bitwise_or(self.mask, paint)
+            self.pending_mask = cv2.bitwise_and(self.pending_mask, cv2.bitwise_not(paint))
+            self.changed()
+            self.finish_local_edit("add", paint)
+            return
         if mode == "reject":
             x, y = coords[0]
             if self.pending_mask[y, x]:
@@ -239,6 +390,7 @@ class Photo:
                 cv2.floodFill(remaining, None, (x, y), 0)
                 self.pending_mask = remaining
                 self.changed()
+                self.finish_local_edit("reject")
                 return
             a, b, c, d = max(0, x - radius), max(0, y - radius), min(self.width, x + radius + 1), min(self.height, y + radius + 1)
             yy, xx = np.nonzero(self.mask[b:d, a:c])
@@ -271,6 +423,7 @@ class Photo:
         if mode in ("erase", "reject"):
             self.clone_strokes = [dict(stroke, mask=np.minimum(stroke["mask"], self.mask[stroke["y0"]:stroke["y1"], stroke["x0"]:stroke["x1"]])) for stroke in self.clone_strokes]
         self.changed()
+        self.finish_local_edit(mode)
 
     def clone(self, source, points, diameter):
         """Copy original, clean donor pixels; preserve depth and all unselected data."""
@@ -309,6 +462,9 @@ class Photo:
         self.pending_mask = remaining
         self.clone_strokes.append(dict(x0=x0, y0=y0, x1=x1, y1=y1, dx=dx, dy=dy, mask=local))
         self.changed()
+        touched = np.zeros_like(self.mask)
+        touched[y0:y1, x0:x1] = local
+        self.finish_local_edit("clone", touched, self.clone_strokes[-1])
 
     def keep_regions(self, points):
         if not points or len(points) > 12000:
@@ -327,11 +483,18 @@ class Photo:
         self.pending_mask = remaining
         self.clone_strokes = [dict(s, mask=np.minimum(s["mask"], self.mask[s["y0"]:s["y1"], s["x0"]:s["x1"]])) for s in self.clone_strokes]
         self.changed()
+        self.finish_local_edit("restore")
 
     def undo(self):
         if self.history:
-            self.mask, self.clone_strokes, self.pending_mask, self.detection_report = self.history.pop()
+            previous_revision = self.revision
+            saved = self.history.pop()
             self.changed()
+            for key in ('mask', 'clone_strokes', 'pending_mask', 'detection_report', 'result', 'heal_report', 'edit_report'):
+                setattr(self, key, saved[key])
+            self.healed_revision = self.revision
+            if saved['bounds'] is not None:
+                self.preview_patch = dict(from_revision=previous_revision, bounds=saved['bounds'])
 
     def clear(self):
         self.checkpoint()
@@ -340,6 +503,7 @@ class Photo:
         self.detection_report = None
         self.clone_strokes = []
         self.changed()
+        self.finish_local_edit("clear")
 
     def heal(self):
         if self.result is None or self.healed_revision != self.revision:
@@ -348,13 +512,17 @@ class Photo:
                 view = auto_mask[stroke["y0"]:stroke["y1"], stroke["x0"]:stroke["x1"]]
                 view[stroke["mask"] > 0] = 0
             self.heal_report = {}
-            self.result = heal_mask(self.original, auto_mask, self.gray, self.heal_report)
+            self.result = self.repair(auto_mask, self.heal_report)
             for stroke in self.clone_strokes:
                 yy, xx = np.nonzero(stroke["mask"])
                 xx, yy = xx + stroke["x0"], yy + stroke["y0"]
                 active = self.mask[yy, xx] > 0
                 xx, yy = xx[active], yy[active]
                 self.result[yy, xx] = self.original[yy + stroke["dy"], xx + stroke["dx"]]
+                if self.associated_alpha:
+                    donor_alpha = self.alpha[yy + stroke["dy"], xx + stroke["dx"]].astype(np.float32)
+                    values = self.result[yy, xx, :-1].astype(np.float32) * self.alpha[yy, xx, None] / np.maximum(donor_alpha[:, None], 1)
+                    self.result[yy, xx, :-1] = np.minimum(np.round(values), self.alpha[yy, xx, None]).astype(self.original.dtype)
             if self.alpha is not None:
                 self.result[:, :, -1] = self.alpha
             self.healed_revision = self.revision
@@ -366,12 +534,15 @@ class Photo:
         if fmt == "tiff":
             tags = [(34675, "B", len(self.icc), self.icc, False)] if self.icc else []
             tifffile.imwrite(stream, result, photometric="minisblack" if self.gray else "rgb",
+                             planarconfig="contig" if result.ndim == 3 else None,
+                             extrasamples=["ASSOCALPHA" if self.associated_alpha else "UNASSALPHA"] if self.alpha is not None else None,
                              metadata=None, extratags=tags, resolution=self.dpi, resolutionunit="INCH")
             return stream.getvalue(), "image/tiff", ".tif"
         if fmt not in ("png", "jpeg"):
             raise ValueError("不支持的导出格式。")
         if fmt == "png" and self.depth == 16:
             raise ValueError("16 位原稿请导出 TIFF，以保留位深。")
+        result = self.straight_pixels(result)
         pixels = (result // 257).astype(np.uint8) if self.depth == 16 else result
         im = Image.fromarray(pixels)
         if fmt == "jpeg" and im.mode not in ("RGB", "L"):
@@ -446,7 +617,7 @@ def split_automatic_candidates(rgb, proposal, level="gentle", polarity="light"):
     hold = np.zeros(n, np.uint8)
     gray_all = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     height, width = proposal.shape
-    limits = {"gentle": (1.3, .10, 4., 160), "standard": (1.7, .15, 6., 240), "more": (2., .20, 8., 400)}[level]
+    limits = {"auto": (5., .45, 15., 1000), "gentle": (1.3, .10, 4., 160), "standard": (1.7, .15, 6., 240), "more": (2., .20, 8., 400)}[level]
     edge_limit, texture_limit, variation_limit, length_limit = limits
     for k in range(1, n):
         x, y, w, h, area = [int(v) for v in stats[k]]
@@ -464,7 +635,7 @@ def split_automatic_candidates(rgb, proposal, level="gentle", polarity="light"):
         bright, dark = float(delta.max()), float(-delta.min())
         unsafe = (max(w, h) > length_limit or np.mean(gradient > edge_limit) > .02 or
                   np.mean(band > 3) > texture_limit or np.std(background) > variation_limit or
-                  (max(w, h) > 16 and max(w, h) / max(1, min(w, h)) > 2.5 and area / (w * h) > .40) or
+                  (max(w, h) > (80 if level == "auto" else 16) and max(w, h) / max(1, min(w, h)) > (8 if level == "auto" else 2.5) and area / (w * h) > .40) or
                   (polarity == "light" and dark > max(12, bright * 1.5)) or
                   (polarity == "dark" and bright > max(12, dark * 1.5)))
         if unsafe:
@@ -764,10 +935,19 @@ def _match_clean_patch(original, full_mask, bounds, gray=False):
     sx1, sy1 = min(width, x1 + reach), min(height, y1 + reach)
     source = _rgb8(original[sy0:sy1, sx0:sx1], gray).astype(np.float32)
     template = _rgb8(target, gray).astype(np.float32)
-    weights = np.repeat(known[:, :, None], 3, axis=2)
-    cost = cv2.matchTemplate(source, template, cv2.TM_SQDIFF, mask=weights) / weights.sum()
+    # Expand weighted squared error into two unmasked correlations. OpenCV's
+    # masked three-channel matcher repeats expensive normalisation work for
+    # every speck; the expression below uses the same RGB error and threshold.
+    weights = known[:, :, None]
+    squared_source = np.sum(source * source, axis=2)
+    cost = cv2.matchTemplate(squared_source, known, cv2.TM_CCORR)
+    cost -= 2 * cv2.matchTemplate(source, template * weights, cv2.TM_CCORR)
+    cost += np.sum(template * template * weights)
+    cost = np.maximum(cost, 0) / (known.sum() * 3)
     dirty = (full_mask[sy0:sy1, sx0:sx1] > 0).astype(np.float32)
-    contaminated = cv2.matchTemplate(dirty, np.ones(known.shape, np.float32), cv2.TM_CCORR) > .5
+    integral = cv2.integral(dirty)
+    kh, kw = known.shape
+    contaminated = (integral[kh:, kw:] - integral[:-kh, kw:] - integral[kh:, :-kw] + integral[:-kh, :-kw]) > .5
     cost[contaminated] = np.inf
     cost[~np.isfinite(cost)] = np.inf
     yy, xx = np.indices(cost.shape)
@@ -780,10 +960,10 @@ def _match_clean_patch(original, full_mask, bounds, gray=False):
     return original[by:by + target.shape[0], bx:bx + target.shape[1]].copy()
 
 
-def heal_mask(original, mask, gray=False, report=None):
+def heal_mask(original, mask, gray=False, report=None, manual=False):
     """Use nearby fill on flat areas; protect scene edges and flag uncertainty."""
     summary = dict(local=0, edge=0, donor=0, pending=[])
-    result = _heal_local(original, mask, gray)
+    result = _heal_local(original, mask, gray, enforce_limit=not manual)
     if np.any(mask):
         n, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
         height, width = mask.shape
@@ -807,6 +987,11 @@ def heal_mask(original, mask, gray=False, report=None):
                     summary["donor"] += 1
             if candidate is None:
                 # Keep original geometry when there is no reliable reconstruction.
+                if manual:
+                    # The user has explicitly identified this as dust. Keep the
+                    # local fill instead of silently restoring the original mark.
+                    summary["manual_fallback"] = summary.get("manual_fallback", 0) + 1
+                    continue
                 candidate = patch
                 summary["pending"].append([int(round(v)) for v in centroids[k]])
             selected = hole > 0
@@ -818,14 +1003,14 @@ def heal_mask(original, mask, gray=False, report=None):
     return result
 
 
-def _heal_local(original, mask, gray=False):
+def _heal_local(original, mask, gray=False, enforce_limit=True):
     """Heal only masked pixels at original depth; unchanged pixels are bit-exact."""
     result = original.copy()
     if not np.any(mask):
         return result
     height, width = mask.shape
     selected_total = np.count_nonzero(mask)
-    if selected_total / mask.size > .15:
+    if enforce_limit and selected_total / mask.size > .15:
         raise ValueError("选区超过照片的 15%，请先减少选区；此工具适合小灰尘和细丝。")
     for y in range(0, height, 768):
         for x in range(0, width, 768):

@@ -20,6 +20,7 @@ from engine import Photo, png_bytes
 ROOT = Path(__file__).resolve().parent
 TOKEN = secrets.token_urlsafe(32)
 SESSIONS = OrderedDict()
+ACTIVE_ID = None
 GLOBAL_LOCK = threading.RLock()
 MAX_UPLOAD = 200 * 1024 * 1024
 class Handler(BaseHTTPRequestHandler):
@@ -61,24 +62,35 @@ class Handler(BaseHTTPRequestHandler):
                     data = data.replace(b"__TOKEN__", TOKEN.encode())
                 self.send(data, mime=mime)
             elif u.path == "/api/health":
-                self.send({"ok": True, "local": True, "version": "1.7.0", "ai": False, "automatic": True})
+                self.send({"ok": True, "local": True, "version": "1.8.1", "ai": False, "automatic": True})
             elif u.path == "/api/image":
                 with GLOBAL_LOCK:
                     photo = SESSIONS.get(query.get("id", [""])[0])
                     if photo is None:
                         raise ValueError("照片已关闭，请重新导入。")
                     kind = query.get("kind", ["original"])[0]
+                    if kind != "original" and str(photo.revision) != query.get("v", [""])[0]:
+                        raise ValueError("照片已更新，请重新加载预览。")
+                    x, y, w, h = 0, 0, photo.width, photo.height
+                    if "rect" in query:
+                        values = [int(v) for v in query['rect'][0].split(',')]
+                        if len(values) != 4:
+                            raise ValueError("预览范围无效。")
+                        x, y, w, h = values
+                        if x < 0 or y < 0 or w < 1 or h < 1 or x + w > photo.width or y + h > photo.height:
+                            raise ValueError("预览范围超出照片。")
+                    region = np.s_[y:y + h, x:x + w]
                     if kind == "mask":
-                        self.send(png_bytes(photo.mask), mime="image/png")
+                        self.send(png_bytes(photo.mask[region]), mime="image/png")
                     elif kind == "overlay":
-                        overlay = np.zeros((photo.height, photo.width, 4), np.uint8)
-                        overlay[photo.pending_mask > 0] = [242, 195, 79, 180]
-                        overlay[photo.mask > 0] = [244, 91, 66, 155]
+                        overlay = np.zeros((h, w, 4), np.uint8)
+                        overlay[photo.pending_mask[region] > 0] = [242, 195, 79, 180]
+                        overlay[photo.mask[region] > 0] = [244, 91, 66, 155]
                         self.send(png_bytes(overlay), mime="image/png")
                     elif kind == "original":
-                        self.send(png_bytes(photo.preview), mime="image/png")
+                        self.send(png_bytes(photo.preview[region]), mime="image/png")
                     elif kind == "result":
-                        self.send(png_bytes(photo.display(photo.heal())), mime="image/png")
+                        self.send(png_bytes(photo.display(photo.heal()[region])), mime="image/png")
                     else:
                         raise ValueError("未知预览类型。")
             else:
@@ -92,6 +104,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send({"error": "预览失败，请重新导入照片。"}, 500)
 
     def do_POST(self):
+        global ACTIVE_ID
         if not self.valid_host() or self.headers.get("X-FilmDust-Token") != TOKEN:
             self.send({"error": "请求无效，请刷新本地页面。"}, 403)
             return
@@ -115,9 +128,12 @@ class Handler(BaseHTTPRequestHandler):
                         name = query.get("name", ["scan"])[0]
                     photo = Photo(raw, name)
                     ident = secrets.token_urlsafe(18)
-                    # One active document, previous one retained for a failed switch.
-                    while len(SESSIONS) >= 2:
-                        SESSIONS.popitem(last=False)
+                    # Uploads are tentative. Protect both the last committed photo
+                    # and the document still displayed by a client after a lost reply.
+                    protected = {ACTIVE_ID, query.get("retain", [""])[0]}
+                    for key in list(SESSIONS):
+                        if key not in protected:
+                            del SESSIONS[key]
                     SESSIONS[ident] = photo
                     self.send(dict(id=ident, **photo.info()))
                     return
@@ -125,30 +141,45 @@ class Handler(BaseHTTPRequestHandler):
                 photo = SESSIONS.get(body.get("id"))
                 if photo is None:
                     raise ValueError("照片已关闭，请重新导入。")
-                if u.path == "/api/process":
-                    photo.process(body.get("level", "gentle"), body.get("options"))
-                elif u.path == "/api/detect":
-                    photo.detect(body.get("sensitivity", 50), body.get("size", 30), body.get("hairs", True), body.get("protect", True), body.get("polarity", "both"))
-                elif u.path == "/api/edit":
-                    photo.edit(body.get("mode"), body.get("points", []), body.get("diameter", 18))
-                elif u.path == "/api/clone":
-                    photo.clone(body.get("source"), body.get("points", []), body.get("diameter", 18))
-                elif u.path == "/api/keep":
-                    photo.keep_regions(body.get("points", []))
-                elif u.path == "/api/undo":
-                    photo.undo()
-                elif u.path == "/api/clear":
-                    photo.clear()
-                elif u.path == "/api/heal":
-                    photo.heal()
+                if u.path == "/api/activate":
+                    ACTIVE_ID = body["id"]
+                elif u.path == "/api/release":
+                    del SESSIONS[body["id"]]
+                    if ACTIVE_ID == body["id"]:
+                        ACTIVE_ID = None
+                    self.send({"ok": True})
+                    return
+                elif u.path == "/api/info":
+                    pass
                 elif u.path == "/api/export":
+                    if body.get("revision") != photo.revision:
+                        raise ValueError("预览已过期，请先重新加载处理结果再保存。")
                     data, mime, suffix = photo.export(body.get("format", "tiff"))
                     name = Path(photo.name).stem + "_除尘" + suffix
                     self.send(data, mime=mime, headers={"Content-Disposition": "attachment; filename*=UTF-8''" + urllib.parse.quote(name)})
                     return
                 else:
-                    self.send({"error": "操作不存在。"}, 404)
-                    return
+                    if body.get("revision") is not None and body["revision"] != photo.revision:
+                        raise ValueError("照片已更新，请先重新加载预览。")
+                    with photo.transaction():
+                        if u.path == "/api/process":
+                            photo.process(body.get("level", "auto"), body.get("options"))
+                        elif u.path == "/api/detect":
+                            photo.detect(body.get("sensitivity", 50), body.get("size", 30), body.get("hairs", True), body.get("protect", True), body.get("polarity", "both"))
+                        elif u.path == "/api/edit":
+                            photo.edit(body.get("mode"), body.get("points", []), body.get("diameter", 18))
+                        elif u.path == "/api/clone":
+                            photo.clone(body.get("source"), body.get("points", []), body.get("diameter", 18))
+                        elif u.path == "/api/keep":
+                            photo.keep_regions(body.get("points", []))
+                        elif u.path == "/api/undo":
+                            photo.undo()
+                        elif u.path == "/api/clear":
+                            photo.clear()
+                        elif u.path == "/api/heal":
+                            photo.heal()
+                        else:
+                            raise ValueError("操作不存在。")
                 self.send(photo.info())
         except (ValueError, TypeError, KeyError) as e:
             self.send({"error": str(e)}, 400)

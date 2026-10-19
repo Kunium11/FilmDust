@@ -25,7 +25,7 @@ info={
  'CFBundleDevelopmentRegion':'zh_CN', 'CFBundleIdentifier':'local.filmdust.mac',
  'CFBundleName':'FilmDust', 'CFBundleDisplayName':'FilmDust',
  'CFBundleExecutable':'FilmDust','CFBundlePackageType':'APPL',
- 'CFBundleShortVersionString':'1.0.0','CFBundleVersion':'1',
+ 'CFBundleShortVersionString':'1.1.1','CFBundleVersion':'3',
  'CFBundleIconFile':'FilmDust.icns','LSMinimumSystemVersion':'13.0',
  'NSHighResolutionCapable':True,'NSPrincipalClass':'NSApplication',
  'LSApplicationCategoryType':'public.app-category.photography',

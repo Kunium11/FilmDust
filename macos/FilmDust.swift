@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 
 // The native window owns exactly one local engine process. It never uses a
 // machine-wide Python installation, opens a Terminal window, or exposes LAN access.
-final class FilmDustApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+final class FilmDustApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     var window: NSWindow!
     var webView: WKWebView!
     var engine: Process?
@@ -13,7 +13,19 @@ final class FilmDustApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     var startupText = ""
     var terminating = false
     var loaded = false
+    var allowTermination = false
     var verified = false
+    var verificationInput: URL?
+    var verificationPreferences: [String: Any]?
+    var verificationRepeat = false
+    var verificationPass = 0
+    var verificationRuns: [[String: Any]] = []
+    var verificationBrush: [Double]?
+    var verificationDidBrush = false
+    var verifiedCloseGuard = false
+    var preferencesStore: UserDefaults {
+        verificationDirectory == nil ? .standard : UserDefaults(suiteName: "local.filmdust.verification")!
+    }
     var verificationDirectory: URL?
     var verificationTimer: Timer?
     var verificationDeadline = Date.distantFuture
@@ -29,10 +41,28 @@ final class FilmDustApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         if let i = args.firstIndex(of: "--verify-app"), args.count > i + 1 {
             verificationDirectory = URL(fileURLWithPath: args[i + 1], isDirectory: true)
         }
+        if let i = args.firstIndex(of: "--verify-input"), args.count > i + 1 {
+            verificationInput = URL(fileURLWithPath: args[i + 1])
+        }
+        if let i = args.firstIndex(of: "--verify-preferences"), args.count > i + 1,
+           let data = args[i + 1].data(using: .utf8) {
+            verificationPreferences = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        }
+        verificationRepeat = args.contains("--verify-repeat")
+        if let i = args.firstIndex(of: "--verify-brush"), args.count > i + 1 {
+            let values = args[i + 1].split(separator: ",").compactMap { Double($0) }
+            if values.count == 3 && values.allSatisfy({ $0.isFinite }) { verificationBrush = values }
+        }
         setupMenus()
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
-        configuration.userContentController.add(self, name: "filmExport")
+        for name in ["filmExport", "filmPreferences", "filmClose"] {
+            configuration.userContentController.add(self, name: name)
+        }
+        let preferences = verificationPreferences ?? preferencesStore.dictionary(forKey: "cleanupPreferences.v1") ?? [:]
+        if let data = try? JSONSerialization.data(withJSONObject: preferences), let json = String(data: data, encoding: .utf8) {
+            configuration.userContentController.addUserScript(WKUserScript(source: "window.filmDustPreferences = \(json);", injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        }
         configuration.limitsNavigationsToAppBoundDomains = true
         webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
@@ -40,6 +70,7 @@ final class FilmDustApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 780), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "FilmDust · 胶片除尘"
         window.minSize = NSSize(width: 640, height: 620)
+        window.delegate = self
         window.contentView = webView
         window.isReleasedWhenClosed = false
         window.center()
@@ -147,15 +178,30 @@ final class FilmDustApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard message.name == "filmExport", message.frameInfo.isMainFrame,
+        guard message.frameInfo.isMainFrame,
               message.frameInfo.securityOrigin.protocol == "http", message.frameInfo.securityOrigin.host == "127.0.0.1",
               message.frameInfo.securityOrigin.port == endpoint?.port,
-              let body = message.body as? [String: Any], let requestId = body["requestId"] as? String,
+              let body = message.body as? [String: Any] else { return }
+        if message.name == "filmPreferences" {
+            guard let sensitivity = body["sensitivity"] as? Double, (1...100).contains(sensitivity),
+                  let size = body["size"] as? Double, (4...100).contains(size),
+                  let polarity = body["polarity"] as? String, ["light", "dark", "both"].contains(polarity),
+                  let protect = body["protect"] as? Bool, let hairs = body["hairs"] as? Bool else { return }
+            preferencesStore.set(["sensitivity": sensitivity, "size": size, "polarity": polarity, "protect": protect, "hairs": hairs], forKey: "cleanupPreferences.v1")
+            return
+        }
+        if message.name == "filmClose", body["confirmed"] as? Bool == true {
+            allowTermination = true
+            NSApp.terminate(nil)
+            return
+        }
+        guard message.name == "filmExport", let requestId = body["requestId"] as? String,
+              let revision = body["revision"] as? Int,
               let id = body["id"] as? String, let format = body["format"] as? String,
               let token = body["token"] as? String, let name = body["name"] as? String,
               ["tiff", "png", "jpeg"].contains(format), id.count <= 256, token.count <= 256, requestId.count <= 128 else { return }
         if let directory = verificationDirectory {
-            export(id: id, format: format, token: token, requestId: requestId, destination: directory.appendingPathComponent("native-export.tif"))
+            export(id: id, revision: revision, format: format, token: token, requestId: requestId, destination: directory.appendingPathComponent("native-export.tif"))
             return
         }
         let panel = NSSavePanel()
@@ -166,18 +212,18 @@ final class FilmDustApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         panel.beginSheetModal(for: window) { [weak self] response in
             guard let self = self else { return }
             guard response == .OK, let destination = panel.url else { self.complete(["requestId": requestId, "cancelled": true]); return }
-            self.export(id: id, format: format, token: token, requestId: requestId, destination: destination)
+            self.export(id: id, revision: revision, format: format, token: token, requestId: requestId, destination: destination)
         }
     }
 
-    func export(id: String, format: String, token: String, requestId: String, destination: URL) {
+    func export(id: String, revision: Int, format: String, token: String, requestId: String, destination: URL) {
         guard let endpoint = endpoint else { complete(["requestId": requestId, "error": "本机服务未连接，请重新打开 App。"]); return }
         var request = URLRequest(url: endpoint.appendingPathComponent("api/export"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(token, forHTTPHeaderField: "X-FilmDust-Token")
         request.setValue(endpoint.absoluteString, forHTTPHeaderField: "Origin")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["id": id, "format": format])
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["id": id, "revision": revision, "format": format])
         network.dataTask(with: request) { [weak self] data, response, error in
             var message: [String: Any] = ["requestId": requestId]
             if let error = error { message["error"] = error.localizedDescription }
@@ -194,35 +240,95 @@ final class FilmDustApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     func complete(_ message: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: message), let json = String(data: data, encoding: .utf8) else { return }
-        webView.evaluateJavaScript("window.filmDustNativeExportComplete(\(json))", completionHandler: nil)
-        if verificationDirectory != nil, message["path"] != nil { finishVerification() }
+        webView.evaluateJavaScript("window.filmDustNativeExportComplete(\(json))") { [weak self] _, _ in
+            guard let self = self else { return }
+            if self.verificationDirectory != nil, message["path"] != nil { self.recordVerification() }
+        }
         if verificationDirectory != nil, let error = message["error"] as? String { verificationFailure(error) }
     }
 
     // A deterministic, opt-in integration check for this app's own bundled page,
-    // process and native save bridge. It uses only the bundled sample photo.
+    // process and native save bridge. External inputs are opt-in, never bundled.
     func beginVerification() {
         guard verificationTimer == nil, !verified, let directory = verificationDirectory else { return }
         do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
         catch { verificationFailure(error.localizedDescription); return }
         verificationDeadline = Date().addingTimeInterval(60)
-        webView.evaluateJavaScript("document.getElementById('sampleBtn').click()", completionHandler: nil)
+        if verificationPreferences != nil {
+            webView.evaluateJavaScript("storePreferences()", completionHandler: nil)
+        }
+        if let input = verificationInput {
+            do {
+                let data = try Data(contentsOf: input)
+                let names = try JSONSerialization.data(withJSONObject: [input.lastPathComponent])
+                let nameJSON = String(data: names, encoding: .utf8)!
+                let script = "importPhoto(new File([Uint8Array.from(atob('\(data.base64EncodedString())'),c=>c.charCodeAt(0))],\(nameJSON)[0]))"
+                webView.evaluateJavaScript(script, completionHandler: nil)
+            } catch { verificationFailure(error.localizedDescription); return }
+        } else {
+            webView.evaluateJavaScript("document.getElementById('sampleBtn').click()", completionHandler: nil)
+        }
         verificationTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             if Date() > self.verificationDeadline { self.verificationFailure("Bundled page processing timed out"); return }
-            self.webView.evaluateJavaScript("!document.getElementById('exportBtn').disabled && document.getElementById('resultSummary').textContent.includes('已处理')") { value, error in
+            let waitForBrush = self.verificationDidBrush ? " && !!window.filmDustBrushCheck" : ""
+            self.webView.evaluateJavaScript("!state.busy && state.ready && (state.lastDuration !== null || state.lastEditDuration !== null)\(waitForBrush)") { value, error in
                 if let error = error { self.verificationFailure(error.localizedDescription); return }
                 guard (value as? Bool) == true else { return }
+                if let brush = self.verificationBrush, !self.verificationDidBrush {
+                    self.verificationDidBrush = true
+                    let script = """
+                    (async()=>{
+                      try {
+                        const point=[\(brush[0]),\(brush[1])], diameter=\(brush[2]), autoSeconds=state.lastDuration;
+                        const pixel=()=>{const c=document.createElement('canvas');c.width=c.height=1;const t=c.getContext('2d');t.drawImage(state.result,point[0],point[1],1,1,0,0,1,1);return Array.from(t.getImageData(0,0,1,1).data);};
+                        const before=pixel();
+                        await mutation('/api/edit',{mode:'add',points:[point],diameter},'正在修补这一处…');
+                        const after=pixel(), firstSeconds=state.lastEditDuration, patch=state.info.preview_patch;
+                        await mutation('/api/undo',{},'正在撤销这一处…');
+                        const undo=pixel(),undoSeconds=state.lastEditDuration;
+                        if(JSON.stringify(before)!==JSON.stringify(undo))throw Error('Undo pixels differ');
+                        await mutation('/api/edit',{mode:'add',points:[point],diameter},'正在修补这一处…');
+                        window.filmDustBrushCheck={before,after,undo,firstSeconds,undoSeconds,repeatSeconds:state.lastEditDuration,patch,autoSeconds,changedPixels:state.info.edit.changed_pixels};
+                      }catch(e){window.filmDustBrushCheck={error:String(e)};}
+                    })()
+                    """
+                    self.webView.evaluateJavaScript(script, completionHandler: nil)
+                    return
+                }
                 self.verificationTimer?.invalidate(); self.verificationTimer = nil
-                self.webView.evaluateJavaScript("document.getElementById('exportBtn').click()", completionHandler: nil)
+                if !self.verifiedCloseGuard {
+                    self.window.performClose(nil)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                        self.webView.evaluateJavaScript("(()=>{const d=document.getElementById('unsavedDialog');const shown=d.open;if(shown)d.close('cancel');return shown&&needsSave();})()") { value, _ in
+                            guard value as? Bool == true else { self.verificationFailure("Unsaved close guard did not preserve the photo"); return }
+                            self.verifiedCloseGuard = true
+                            self.webView.evaluateJavaScript("document.getElementById('exportBtn').click()", completionHandler: nil)
+                        }
+                    }
+                } else {
+                    self.webView.evaluateJavaScript("document.getElementById('exportBtn').click()", completionHandler: nil)
+                }
             }
+        }
+    }
+
+    func recordVerification() {
+        webView.evaluateJavaScript("JSON.stringify({seconds:window.filmDustBrushCheck?.autoSeconds??state.lastDuration,brush:window.filmDustBrushCheck,settings:state.info.detection.settings,revision:state.info.revision,width:state.info.width,height:state.info.height,processed:state.info.processed_count,dirty:needsSave()})") { [weak self] value, _ in
+            guard let self = self else { return }
+            if let value = value as? String, let data = value.data(using: .utf8), let report = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] { self.verificationRuns.append(report) }
+            if self.verificationRepeat && self.verificationPass == 0 {
+                self.verificationPass += 1
+                self.beginVerification()
+            } else { self.finishVerification() }
         }
     }
 
     func finishVerification() {
         guard !verified, let directory = verificationDirectory else { return }
         verified = true
-        webView.evaluateJavaScript("JSON.stringify({ready:!document.getElementById('exportBtn').disabled,summary:document.getElementById('resultSummary').textContent,width:innerWidth,height:innerHeight,nativeBridge:!!window.webkit.messageHandlers.filmExport})") { [weak self] value, error in
+        if let data = try? JSONSerialization.data(withJSONObject: verificationRuns, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: directory.appendingPathComponent("native-runs.json")) }
+        webView.evaluateJavaScript("JSON.stringify({ready:!document.getElementById('exportBtn').disabled,summary:document.getElementById('resultSummary').textContent,width:innerWidth,height:innerHeight,nativeBridge:!!window.webkit.messageHandlers.filmExport,closeGuard:\(verifiedCloseGuard),port:location.port})") { [weak self] value, error in
             guard let self = self else { return }
             if let value = value as? String { try? value.write(to: directory.appendingPathComponent("native-check.json"), atomically: true, encoding: .utf8) }
             let config = WKSnapshotConfiguration()
@@ -238,8 +344,17 @@ final class FilmDustApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     func verificationFailure(_ text: String) {
-        if let directory = verificationDirectory { try? text.write(to: directory.appendingPathComponent("native-failure.txt"), atomically: true, encoding: .utf8) }
-        terminating = true; stopEngine(); NSApp.terminate(nil)
+        verificationTimer?.invalidate(); verificationTimer = nil
+        guard let directory = verificationDirectory else { terminating = true; stopEngine(); NSApp.terminate(nil); return }
+        try? text.write(to: directory.appendingPathComponent("native-failure.txt"), atomically: true, encoding: .utf8)
+        webView.evaluateJavaScript("JSON.stringify({busy:state.busy,ready:state.ready,revision:state.info?.revision,renderedRevision:state.renderedRevision,seconds:state.lastDuration,editSeconds:state.lastEditDuration,brush:window.filmDustBrushCheck,toast:document.getElementById('toast').textContent,phase:document.getElementById('busyText').textContent})") { [weak self] value, _ in
+            guard let self = self else { return }
+            if let value = value as? String { try? value.write(to: directory.appendingPathComponent("native-failure-state.json"), atomically: true, encoding: .utf8) }
+            self.webView.takeSnapshot(with: WKSnapshotConfiguration()) { image, _ in
+                if let image = image, let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff), let data = rep.representation(using: .png, properties: [:]) { try? data.write(to: directory.appendingPathComponent("native-failure-window.png")) }
+                self.terminating = true; self.stopEngine(); NSApp.terminate(nil)
+            }
+        }
     }
 
     func fail(_ text: String) {
@@ -255,6 +370,16 @@ final class FilmDustApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         outputPipe?.fileHandleForReading.readabilityHandler = nil
         if let engine = engine, engine.isRunning { engine.terminate() }
         network.invalidateAndCancel()
+    }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if allowTermination || terminating || !loaded { return true }
+        webView.evaluateJavaScript("window.filmDustRequestClose()", completionHandler: nil)
+        return false
+    }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if allowTermination || terminating || !loaded { return .terminateNow }
+        webView.evaluateJavaScript("window.filmDustRequestClose()", completionHandler: nil)
+        return .terminateCancel
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationWillTerminate(_ notification: Notification) { terminating = true; stopEngine() }
