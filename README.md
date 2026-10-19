@@ -71,4 +71,4 @@ FILMDUST_TIMING_GATE=1 FILMDUST_TIMING_SAMPLE=/path/to/scan.jpg \
 - `scripts/`：本地启动与Mac构建入口。
 - `tests/`：图像质量与自动处理检查。
 
-本仓库未授予开源许可证；依赖遵循各自许可证，Mac构建会收集组件许可文件。上传仓库不表示已完成商店发布或Apple公证。
+本仓库以 MIT 许可证发布，许可全文见根目录 `LICENSE`。依赖遵循各自许可证，Mac构建会收集组件许可文件。上传仓库不表示已完成商店发布或Apple公证。
