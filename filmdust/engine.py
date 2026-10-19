@@ -1053,9 +1053,12 @@ def heal_mask(original, mask, gray=False, report=None, manual=False):
     return result
 
 
-# Same halo the tile sweep used so inpaint still sees neighboring defects.
+# Halo used so inpaint sees neighboring defects. Above this many components,
+# one inpaint per occupied 768 tile is cheaper than one call per speck.
 _HEAL_MARGIN = 48
 _INPAINT_RADIUS = 4
+_HEAL_TILE = 768
+_HEAL_TILE_FALLBACK = 256
 
 
 def _inpaint_ns(patch, local_mask, gray):
@@ -1068,12 +1071,98 @@ def _inpaint_ns(patch, local_mask, gray):
     return healed
 
 
-def _heal_local(original, mask, gray=False, enforce_limit=True):
-    """Inpaint each connected mask component plus a margin.
+def _paint_mask_window(result, original, binary, gray, y0, y1, x0, x1, owned):
+    """Inpaint one window. `owned` selects which holes in that window are written."""
+    if y1 <= y0 or x1 <= x0 or not np.any(owned):
+        return
+    local_mask = np.ascontiguousarray(binary[y0:y1, x0:x1] * 255)
+    healed = _inpaint_ns(original[y0:y1, x0:x1], local_mask, gray)
+    target = result[y0:y1, x0:x1]
+    target[owned] = healed[owned]
 
-    Unselected pixels stay bit-exact. Other mask pixels inside the margin are
-    holes for this inpaint, so a neighboring defect is not used as source.
-    The image is not scanned on a fixed tile grid.
+
+def _tiles_for_box(y0, x0, y1, x1, height, width):
+    y0, x0 = max(0, y0), max(0, x0)
+    y1, x1 = min(height, y1), min(width, x1)
+    if y1 <= y0 or x1 <= x0:
+        return []
+    tiles = []
+    for ty in range(y0 // _HEAL_TILE, (y1 - 1) // _HEAL_TILE + 1):
+        for tx in range(x0 // _HEAL_TILE, (x1 - 1) // _HEAL_TILE + 1):
+            tiles.append((ty, tx))
+    return tiles
+
+
+def _paint_occupied_tiles(result, original, binary, gray, tiles):
+    """Inpaint the same 768 windows as a full tile pass, and skip every other tile."""
+    height, width = binary.shape
+    for ty, tx in sorted(tiles):
+        y, x = ty * _HEAL_TILE, tx * _HEAL_TILE
+        if y >= height or x >= width:
+            continue
+        hh, ww = min(_HEAL_TILE, height - y), min(_HEAL_TILE, width - x)
+        central = binary[y:y + hh, x:x + ww] > 0
+        if not central.any():
+            continue
+        y0, y1 = max(0, y - _HEAL_MARGIN), min(height, y + hh + _HEAL_MARGIN)
+        x0, x1 = max(0, x - _HEAL_MARGIN), min(width, x + ww + _HEAL_MARGIN)
+        local_mask = np.ascontiguousarray(binary[y0:y1, x0:x1] * 255)
+        healed = _inpaint_ns(original[y0:y1, x0:x1], local_mask, gray)
+        target = result[y:y + hh, x:x + ww]
+        source = healed[y - y0:y - y0 + hh, x - x0:x - x0 + ww]
+        target[central] = source[central]
+
+
+def _group_mask_components(stats, origin_x, origin_y, width, height):
+    """Merge components whose margin boxes touch into one inpaint group."""
+    rects = []
+    for k in range(1, stats.shape[0]):
+        x, y, w, h, _ = (int(v) for v in stats[k])
+        if w == 0 or h == 0:
+            continue
+        ax, ay = origin_x + x, origin_y + y
+        rects.append((k, ax, ay, ax + w, ay + h,
+                      max(0, ax - _HEAL_MARGIN), max(0, ay - _HEAL_MARGIN),
+                      min(width, ax + w + _HEAL_MARGIN), min(height, ay + h + _HEAL_MARGIN)))
+    parent = list(range(len(rects)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    cell = _HEAL_MARGIN * 2
+    buckets = {}
+    for index, item in enumerate(rects):
+        x0, y0, x1, y1 = item[5:9]
+        for gy in range(y0 // cell, max(y0, y1 - 1) // cell + 1):
+            for gx in range(x0 // cell, max(x0, x1 - 1) // cell + 1):
+                buckets.setdefault((gy, gx), []).append(index)
+    for ids in buckets.values():
+        for a in range(len(ids)):
+            ax0, ay0, ax1, ay1 = rects[ids[a]][5:9]
+            for b in range(a + 1, len(ids)):
+                bx0, by0, bx1, by1 = rects[ids[b]][5:9]
+                if ax0 < bx1 and bx0 < ax1 and ay0 < by1 and by0 < ay1:
+                    union(ids[a], ids[b])
+    groups = {}
+    for index, item in enumerate(rects):
+        groups.setdefault(find(index), []).append(item)
+    return list(groups.values())
+
+
+def _heal_local(original, mask, gray=False, enforce_limit=True):
+    """Inpaint masked pixels without walking empty areas of the frame.
+
+    Nearby components share one inpaint, expanded by the same 48px margin.
+    A dense mask uses one inpaint per occupied 768 tile instead, and never
+    inpaints a tile that contains no mask. Unselected pixels stay bit-exact.
     """
     result = original.copy()
     if not np.any(mask):
@@ -1081,26 +1170,52 @@ def _heal_local(original, mask, gray=False, enforce_limit=True):
     height, width = mask.shape
     binary = np.ascontiguousarray((mask > 0).astype(np.uint8))
     selected_total = int(cv2.countNonZero(binary))
-    if enforce_limit and selected_total / mask.size > .15:
+    if enforce_limit and selected_total / binary.size > .15:
         raise ValueError("选区超过照片的 15%，请先减少选区；此工具适合小灰尘和细丝。")
-    # Label only where the mask actually is. A corner mark must not build a
-    # full-frame label image, and this is not a tile inpaint sweep.
     bx, by, bw, bh = cv2.boundingRect(binary)
-    sub = binary[by:by + bh, bx:bx + bw]
-    _, labels, stats, _ = cv2.connectedComponentsWithStats(sub, 8)
-    for k in range(1, stats.shape[0]):
-        x, y, w, h, _ = (int(v) for v in stats[k])
-        if w == 0 or h == 0:
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(binary[by:by + bh, bx:bx + bw], 8)
+    if stats.shape[0] - 1 >= _HEAL_TILE_FALLBACK:
+        tiles = []
+        seen = set()
+        for k in range(1, stats.shape[0]):
+            x, y, w, h, _ = (int(v) for v in stats[k])
+            for tile in _tiles_for_box(by + y, bx + x, by + y + h, bx + x + w, height, width):
+                if tile not in seen:
+                    seen.add(tile)
+                    tiles.append(tile)
+        _paint_occupied_tiles(result, original, binary, gray, tiles)
+        return result
+    tiled = set()
+    small_groups = []
+    for items in _group_mask_components(stats, bx, by, width, height):
+        x0 = min(item[5] for item in items)
+        y0 = min(item[6] for item in items)
+        x1 = max(item[7] for item in items)
+        y1 = max(item[8] for item in items)
+        if x1 - x0 > _HEAL_TILE or y1 - y0 > _HEAL_TILE:
+            for item in items:
+                tiled.update(_tiles_for_box(item[2], item[1], item[4], item[3], height, width))
+        else:
+            small_groups.append((items, x0, y0, x1, y1))
+    if tiled:
+        _paint_occupied_tiles(result, original, binary, gray, tiled)
+    keep = np.zeros(stats.shape[0], np.uint8)
+    for items, x0, y0, x1, y1 in small_groups:
+        keep.fill(0)
+        keep[[item[0] for item in items]] = 1
+        iy0, iy1 = max(y0, by), min(y1, by + bh)
+        ix0, ix1 = max(x0, bx), min(x1, bx + bw)
+        if iy1 <= iy0 or ix1 <= ix0:
             continue
-        ay, ax = by + y, bx + x
-        y0, y1 = max(0, ay - _HEAL_MARGIN), min(height, ay + h + _HEAL_MARGIN)
-        x0, x1 = max(0, ax - _HEAL_MARGIN), min(width, ax + w + _HEAL_MARGIN)
-        local_mask = np.ascontiguousarray(binary[y0:y1, x0:x1] * 255)
-        healed = _inpaint_ns(original[y0:y1, x0:x1], local_mask, gray)
-        component = labels[y:y + h, x:x + w] == k
-        target = result[ay:ay + h, ax:ax + w]
-        source = healed[ay - y0:ay - y0 + h, ax - x0:ax - x0 + w]
-        target[component] = source[component]
+        owned = keep[labels[iy0 - by:iy1 - by, ix0 - bx:ix1 - bx]] > 0
+        # The inpaint window can extend past the label crop. Pad `owned` to that window.
+        if (iy0, ix0, iy1, ix1) != (y0, x0, y1, x1):
+            full = np.zeros((y1 - y0, x1 - x0), bool)
+            full[iy0 - y0:iy1 - y0, ix0 - x0:ix1 - x0] = owned
+            owned = full
+            _paint_mask_window(result, original, binary, gray, y0, y1, x0, x1, owned)
+        else:
+            _paint_mask_window(result, original, binary, gray, y0, y1, x0, x1, owned)
     return result
 
 
