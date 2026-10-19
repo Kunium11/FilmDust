@@ -22,6 +22,7 @@ function interactive(){
  $('retryBtn').disabled=state.busy;
  if(state.outdated)for(const id of ['importBtn','chooseBtn','sampleBtn'])$(id).disabled=true;
  $('undoBtn').disabled=!editable||!state.info?.undo;
+ $('redoBtn').disabled=!editable||!state.info?.redo;
  for(const id of ['keepBtn','restoreBtn','previousBtn','nextBtn'])$(id).disabled=!editable||!state.reviewGroups.length;
  $('exportBtn').title=state.pendingPreview?'请先重新加载预览':'保存当前显示结果的副本';
 }
@@ -236,7 +237,7 @@ async function mutation(path,body,message){
  try{
   const info=await(await api(path,{revision:state.info.revision,...body})).json();state.ready=false;state.lastDuration=null;state.lastEditDuration=null;
   updateInfo(info);await preview(info);setView('compare');
-  if(showReviews&&state.reviewGroups.length)focusReview(false);if(path==='/api/undo')state.cloneSource=null;
+  if(showReviews&&state.reviewGroups.length)focusReview(false);if(path==='/api/undo'||path==='/api/redo')state.cloneSource=null;
   await afterPreviewDraw();
   state.lastEditDuration=(performance.now()-started)/1000;updateInfo(info);
   if(path==='/api/edit'&&body.mode==='add'&&info.edit?.changed_pixels===0)toast('这一处没有新增像素变化；请确认画笔覆盖了灰尘，或使用取样修补。');
@@ -369,7 +370,7 @@ $('fileInput').onchange=e=>{if(e.target.files[0])importPhoto(e.target.files[0]);
 $('retryBtn').onclick=retryPreview;
 $('originalBtn').onclick=()=>setView(state.view==='original'?'compare':'original');$('changesBtn').onclick=()=>setView(state.view==='mask'?'compare':'mask');
 $('correctBtn').onclick=()=>openCorrection($('correctionPanel').hidden);$('closeCorrectionBtn').onclick=()=>openCorrection(false);
-$('undoBtn').onclick=()=>mutation('/api/undo',{},'正在撤销并更新效果…');$('clearBtn').onclick=()=>{$('settingsDialog').close();mutation('/api/clear',{},'正在恢复原图…');};
+$('undoBtn').onclick=()=>mutation('/api/undo',{},'正在撤销并更新效果…');$('redoBtn').onclick=()=>mutation('/api/redo',{},'正在重做并更新效果…');$('clearBtn').onclick=()=>{$('settingsDialog').close();mutation('/api/clear',{},'正在恢复原图…');};
 $('reviewBtn').onclick=()=>{focusReview();requestAnimationFrame(()=>focusReview(false));};$('nextBtn').onclick=()=>{state.reviewIndex=(state.reviewIndex+1)%state.reviewGroups.length;focusReview(false);};$('previousBtn').onclick=()=>{state.reviewIndex=(state.reviewIndex-1+state.reviewGroups.length)%state.reviewGroups.length;focusReview(false);};
 $('keepBtn').onclick=()=>{const g=state.reviewGroups[state.reviewIndex];if(g)mutation('/api/keep',{points:g.items.map(i=>i.point)},'正在保留本区域原样…');};
 $('restoreBtn').onclick=()=>{if(state.reviewPoint)mutation('/api/keep',{points:[state.reviewPoint]},'正在还原当前标记…');};
@@ -381,7 +382,7 @@ $('resetSettingsBtn').onclick=()=>showPreferences(defaults);
 for(const id of ['sensitivity','size','brush'])$(id).oninput=()=>{$(`${id}Val`).textContent=$(id).value;};
 $('exportBtn').onclick=saveCopy;$('exportOptionsBtn').onclick=()=>$('exportDialog').showModal();$('exportFormat').onchange=()=>{state.lossyConfirmedFor=$('exportFormat').value==='jpeg'&&state.info?.depth===16?state.id:null;updateExportNote();};$('helpBtn').onclick=()=>$('helpDialog').showModal();
 let dragDepth=0;document.addEventListener('dragenter',e=>{e.preventDefault();if(e.dataTransfer.types.includes('Files')){dragDepth++;$('dropOverlay').hidden=false;}});document.addEventListener('dragover',e=>e.preventDefault());document.addEventListener('dragleave',e=>{e.preventDefault();dragDepth=Math.max(0,dragDepth-1);if(!dragDepth)$('dropOverlay').hidden=true;});document.addEventListener('drop',e=>{e.preventDefault();dragDepth=0;$('dropOverlay').hidden=true;if(e.dataTransfer.files[0])importPhoto(e.dataTransfer.files[0]);});
-document.addEventListener('keydown',e=>{if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName)||document.querySelector('dialog[open]')||!state.id||state.busy)return;if(e.key===' '){e.preventDefault();state.space=true;canvas.style.cursor='grab';return;}if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='s'){e.preventDefault();saveCopy();return;}if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='z'){e.preventDefault();if(state.info.undo)mutation('/api/undo',{},'正在撤销并更新…');return;}const key=e.key.toLowerCase(),tool={h:'pan',b:'add',e:'reject',r:'erase',s:'clone'}[key];if(tool){openCorrection(true);setTool(tool);}if(key==='o'){state.compareBefore=true;draw();}});
+document.addEventListener('keydown',e=>{if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName)||document.querySelector('dialog[open]')||!state.id||state.busy)return;if(e.key===' '){e.preventDefault();state.space=true;canvas.style.cursor='grab';return;}if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='s'){e.preventDefault();saveCopy();return;}if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='z'){e.preventDefault();if(e.shiftKey){if(state.info.redo)mutation('/api/redo',{},'正在重做并更新…');}else if(state.info.undo)mutation('/api/undo',{},'正在撤销并更新…');return;}const key=e.key.toLowerCase(),tool={h:'pan',b:'add',e:'reject',r:'erase',s:'clone'}[key];if(tool){openCorrection(true);setTool(tool);}if(key==='o'){state.compareBefore=true;draw();}});
 document.addEventListener('keyup',e=>{if(e.key===' '){state.space=false;canvas.style.cursor=state.tool==='pan'?'grab':'crosshair';}if(e.key.toLowerCase()==='o'){state.compareBefore=false;draw();}});window.addEventListener('blur',()=>{state.space=false;state.compareBefore=false;draw();});
 $('compareSlider').oninput=e=>{state.split=Number(e.target.value)/100;draw();};
 new ResizeObserver(resize).observe(stage);resize();interactive();

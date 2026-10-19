@@ -95,6 +95,7 @@ final class FilmDustApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let editItem = NSMenuItem(title: "编辑", action: nil, keyEquivalent: ""); main.addItem(editItem)
         let editMenu = NSMenu(title: "编辑"); editItem.submenu = editMenu
         let undo = NSMenuItem(title: "撤销", action: #selector(undoEdit), keyEquivalent: "z"); undo.target = self; editMenu.addItem(undo)
+        let redo = NSMenuItem(title: "重做", action: #selector(redoEdit), keyEquivalent: "Z"); redo.target = self; editMenu.addItem(redo)
         editMenu.addItem(.separator())
         editMenu.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
@@ -105,6 +106,7 @@ final class FilmDustApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     @objc func importPhoto() { if loaded { webView.evaluateJavaScript("document.getElementById('fileInput').click()", completionHandler: nil) } }
     @objc func savePhoto() { if loaded { webView.evaluateJavaScript("document.getElementById('exportBtn').click()", completionHandler: nil) } }
     @objc func undoEdit() { if loaded { webView.evaluateJavaScript("document.getElementById('undoBtn').click()", completionHandler: nil) } }
+    @objc func redoEdit() { if loaded { webView.evaluateJavaScript("document.getElementById('redoBtn').click()", completionHandler: nil) } }
 
     func startEngine() {
         guard let resources = Bundle.main.resourceURL else { fail("应用文件不完整，请重新解压 FilmDust。"); return }
