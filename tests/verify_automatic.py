@@ -35,6 +35,35 @@ class AutomaticChecks(unittest.TestCase):
   selected,pending,_=split_automatic_candidates(rgb,mask)
   self.assertFalse(np.any(selected));np.testing.assert_array_equal(mask,pending)
 
+ def test_auto_holds_diagonal_structure_and_keeps_curve_and_speck(self):
+  rgb=np.full((320,520,3),128,np.uint8)
+  mask=np.zeros(rgb.shape[:2],np.uint8)
+  cv2.line(mask,(24,36),(490,96),255,3)
+  curve=np.array([[x,190+int(18*np.sin((x-40)/12.))] for x in range(40,280)],np.int32)
+  cv2.polylines(mask,[curve],False,255,2)
+  cv2.circle(mask,(70,270),3,255,-1)
+  selected,pending,_=split_automatic_candidates(rgb,mask,'auto','light')
+  line=np.zeros_like(mask);cv2.line(line,(24,36),(490,96),255,3)
+  curved=np.zeros_like(mask);cv2.polylines(curved,[curve],False,255,2)
+  self.assertEqual(np.count_nonzero(selected[line>0]),0)
+  self.assertGreater(np.count_nonzero(pending[line>0]),0)
+  self.assertGreater(np.count_nonzero(selected[curved>0]),0)
+  self.assertGreater(selected[270,70],0)
+  self.assertFalse(np.any((selected>0)&(pending>0)))
+
+ def test_auto_process_holds_bright_diagonal_and_heals_speck(self):
+  a=np.full((360,480,3),110,np.uint8)
+  cv2.line(a,(30,50),(450,110),(245,245,245),3)
+  cv2.circle(a,(90,250),3,(250,250,250),-1)
+  p=make_photo(a)
+  p.process('auto',dict(sensitivity=70,size=30,polarity='light',protect=True,hairs=True))
+  line=np.zeros(a.shape[:2],np.uint8);cv2.line(line,(30,50),(450,110),255,3)
+  self.assertEqual(np.count_nonzero(p.mask[line>0]),0)
+  self.assertGreater(np.count_nonzero(p.pending_mask[line>0]),0)
+  np.testing.assert_array_equal(p.result[line>0],a[line>0])
+  self.assertGreater(p.mask[250,90],0)
+  self.assertTrue(np.any(p.result[247:254,87:94]!=a[247:254,87:94]))
+
  def test_candidate_partition_is_complete_and_disjoint(self):
   rgb=np.full((200,240,3),120,np.uint8);mask=np.zeros(rgb.shape[:2],np.uint8)
   cv2.circle(mask,(80,70),4,255,-1);cv2.line(mask,(120,100),(170,100),255,3)
