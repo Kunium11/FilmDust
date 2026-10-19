@@ -610,6 +610,38 @@ def _frame_exclusion(gray):
     return excluded
 
 
+def _straight_structure_band(comp):
+    """A long, narrow, nearly straight candidate is scene structure, not dust.
+
+    Platform edges, safety lines, rails, wires and window bars are often diagonal,
+    so the axis-aligned box is mostly empty and the filled-box hold never sees them.
+    A wide median also erases a thin line, which is why the edge gate misses it.
+    Measure length and straightness along the band itself. Sensitivity and the
+    existing split limits are unchanged. Curved strands stay selectable.
+    """
+    ys, xs = np.nonzero(comp)
+    count = int(xs.size)
+    if count < 48:
+        return False
+    points = np.column_stack((xs, ys)).astype(np.float32)
+    vx, vy, xm, ym = cv2.fitLine(points, cv2.DIST_L2, 0, .01, .01).ravel()
+    dist = np.abs((xs - xm) * vy - (ys - ym) * vx)
+    tangent = xs * vx + ys * vy
+    fit_len = float(tangent.max() - tangent.min()) + 1.
+    if fit_len < 80:
+        return False
+    thick = count / fit_len
+    if thick < .7 or thick > 24 or fit_len / thick < 8:
+        return False
+    # A filled straight band sits about thick/4 from its centerline. Extra
+    # deviation is bend. Window bars are a little uneven; arcs and blobs are not.
+    if float(np.mean(dist)) - thick / 4 > 3 or float(np.percentile(dist, 95)) > max(10., thick * 1.25):
+        return False
+    bins = max(8, int(fit_len))
+    index = np.clip(((tangent - float(tangent.min())) / fit_len * (bins - 1)).astype(np.int32), 0, bins - 1)
+    return float(np.count_nonzero(np.bincount(index, minlength=bins))) / bins >= .8
+
+
 def split_automatic_candidates(rgb, proposal, level="gentle", polarity="light"):
     """Keep pixel/structure conflicts as original pixels, never an AI verdict."""
     n, labels, stats, _ = cv2.connectedComponentsWithStats(proposal, 8)
@@ -633,11 +665,15 @@ def split_automatic_candidates(rgb, proposal, level="gentle", polarity="light"):
         background = ref[iy:iy + h, ix:ix + w]
         delta = (gray.astype(np.float32) - ref)[iy:iy + h, ix:ix + w]
         bright, dark = float(delta.max()), float(-delta.min())
+        # 57px is the shorter side of an 80px diagonal, so a slanted safety line
+        # still reaches the straight-band check. Limits above are intentionally
+        # the same numbers as before.
         unsafe = (max(w, h) > length_limit or np.mean(gradient > edge_limit) > .02 or
                   np.mean(band > 3) > texture_limit or np.std(background) > variation_limit or
                   (max(w, h) > (80 if level == "auto" else 16) and max(w, h) / max(1, min(w, h)) > (8 if level == "auto" else 2.5) and area / (w * h) > .40) or
                   (polarity == "light" and dark > max(12, bright * 1.5)) or
-                  (polarity == "dark" and bright > max(12, dark * 1.5)))
+                  (polarity == "dark" and bright > max(12, dark * 1.5)) or
+                  (max(w, h) >= 57 and _straight_structure_band(labels[y:y + h, x:x + w] == k)))
         if unsafe:
             hold[k] = 255
         else:
