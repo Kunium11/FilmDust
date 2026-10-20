@@ -24,6 +24,7 @@ QUICK_PREVIEW_EDGE = 2048
 # machine and stays capped so each worker's float scratch does not grow with
 # every logical CPU. FILMDUST_DETECT_WORKERS=1 keeps the serial loop.
 _DETECT_WORKER_CAP = 8
+_DETECT_THREAD_LOCK = threading.RLock()
 # Undo keeps changed rectangles, not another full frame. The cap is the
 # retained patch bytes; a step is never dropped if it is the only one.
 UNDO_BYTE_BUDGET = 256 * 1024 * 1024
@@ -1166,8 +1167,8 @@ def detect_worker_count():
 
 
 def _pin_opencv_one_thread():
-    """OpenCV's own pool does not speed these medians and would fight the workers."""
-    cv2.setNumThreads(1)
+    """Disable the inner pool, including GCD which only supports nonpositive values."""
+    cv2.setNumThreads(0)
 
 
 def _run_tile_jobs(jobs, tile):
@@ -1177,13 +1178,17 @@ def _run_tile_jobs(jobs, tile):
         for job in jobs:
             tile(job)
         return
-    previous = cv2.getNumThreads()
-    cv2.setNumThreads(1)
-    try:
-        with ThreadPoolExecutor(max_workers=min(workers, len(jobs)), initializer=_pin_opencv_one_thread) as pool:
-            list(pool.map(tile, jobs, chunksize=1))
-    finally:
-        cv2.setNumThreads(previous)
+    # OpenCV's thread setting is process-wide and is not thread-safe. Set it
+    # before starting workers; serialize overlapping detection scopes so one
+    # request cannot restore the pool while another still processes tiles.
+    with _DETECT_THREAD_LOCK:
+        previous = cv2.getNumThreads()
+        _pin_opencv_one_thread()
+        try:
+            with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
+                list(pool.map(tile, jobs, chunksize=1))
+        finally:
+            cv2.setNumThreads(0 if previous == 1 else previous)
 
 
 def _tile_origins(height, width):

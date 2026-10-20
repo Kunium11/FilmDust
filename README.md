@@ -4,6 +4,8 @@
 
 照片在本机处理，不调用云端 AI，不覆盖原文件。服务只监听127.0.0.1，原生App的文件选择和保存使用系统对话框。
 
+M 系列 Mac 的已构建安装包见 [GitHub Releases](https://github.com/Kunium11/FilmDust/releases/latest)。打开 DMG，将 FilmDust 拖入“应用程序”；更新前先保存旧窗口的结果并退出。
+
 ## 功能
 
 - 一个自动除尘流程，减少漏掉的淡灰痕和弯曲细丝；高级设置可调整灵敏度、尺寸和灰尘颜色。

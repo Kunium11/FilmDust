@@ -25,7 +25,7 @@ info={
  'CFBundleDevelopmentRegion':'zh_CN', 'CFBundleIdentifier':'local.filmdust.mac',
  'CFBundleName':'FilmDust', 'CFBundleDisplayName':'FilmDust',
  'CFBundleExecutable':'FilmDust','CFBundlePackageType':'APPL',
- 'CFBundleShortVersionString':'1.1.1','CFBundleVersion':'3',
+ 'CFBundleShortVersionString':'1.1.2','CFBundleVersion':'4',
  'CFBundleIconFile':'FilmDust.icns','LSMinimumSystemVersion':'13.0',
  'NSHighResolutionCapable':True,'NSPrincipalClass':'NSApplication',
  'LSApplicationCategoryType':'public.app-category.photography',
@@ -50,6 +50,7 @@ for y in (398,626):
 d.polygon([(462,564),(512,468),(562,564)],outline='white',width=22)
 icon.save(resources/'FilmDust.icns',format='ICNS')
 licenses=resources/'Licenses';licenses.mkdir()
+shutil.copy2(root/'LICENSE',licenses/'FilmDust-LICENSE.txt')
 for package in ['numpy','opencv-python','opencv-python-headless','Pillow','tifffile','imagecodecs','pyinstaller']:
     try:dist=metadata.distribution(package)
     except metadata.PackageNotFoundError:continue

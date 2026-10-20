@@ -223,6 +223,28 @@ class QualityChecks(unittest.TestCase):
             else:
                 os.environ["FILMDUST_DETECT_WORKERS"] = saved
 
+    def test_parallel_tiles_restore_disabled_opencv_threads_even_on_failure(self):
+        previous = cv2.getNumThreads()
+        saved = os.environ.get("FILMDUST_DETECT_WORKERS")
+        try:
+            os.environ["FILMDUST_DETECT_WORKERS"] = "2"
+            cv2.setNumThreads(0)
+            seen = []
+            engine._run_tile_jobs([0, 1], lambda _: seen.append(cv2.getNumThreads()))
+            self.assertEqual(seen, [1, 1])
+            self.assertEqual(cv2.getNumThreads(), 1)
+            def fail(_):
+                raise RuntimeError("tile failed")
+            with self.assertRaisesRegex(RuntimeError, "tile failed"):
+                engine._run_tile_jobs([0, 1], fail)
+            self.assertEqual(cv2.getNumThreads(), 1)
+        finally:
+            if saved is None:
+                os.environ.pop("FILMDUST_DETECT_WORKERS", None)
+            else:
+                os.environ["FILMDUST_DETECT_WORKERS"] = saved
+            cv2.setNumThreads(0 if previous == 1 else previous)
+
     def test_parallel_tiles_match_serial_mask(self):
         """Multi-tile light and strong passes stay bit-identical when spread across cores."""
         image = np.full((1100, 1300, 3), [70, 100, 130], np.uint8)

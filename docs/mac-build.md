@@ -10,7 +10,7 @@
 python3 scripts/build_mac.py --verify
 ```
 
-当前版本为Mac App1.1.1、引擎1.8.6，构建目标arm64／macOS13及以上。除本机macOS26.6.2外没有额外系统兼容性保证。这里是本地临时签名，没有Developer ID公证，公开分发前需另行处理签名与公证。
+当前版本为Mac App1.1.2、引擎1.8.7，构建目标arm64／macOS13及以上。除本机macOS26.6.2外没有额外系统兼容性保证。这里是本地临时签名，没有Developer ID公证，公开分发前需另行处理签名与公证。
 
 构建仅清理自己生成的App上的Finder装饰属性，不关闭系统安全功能，也不移除隔离属性。组件许可随App一起打包。
 
@@ -24,9 +24,11 @@ python3 scripts/build_mac.py --verify
 - `--verify-repeat`：保存完成后再次导入同一照片，检查连续处理。
 - `--verify-brush x,y,diameter`：在原图像素坐标处补画，检查结果、撤销后像素、再次补画和保存；目前应与 `--verify-repeat` 分开运行。
 
-`native-runs.json` 记录从开始导入到全分辨率对比绘制完成的时间，包括上传、识别、修补、预览编码、传输和显示；不包含用户选择文件的时间或 App 冷启动。`native-export.tif` 是通过真实原生保存桥接写出的副本。
+`native-runs.json` 中的 `seconds` 记录从开始导入到全分辨率自动计算完成、可保存对比显示的时间，包括上传、识别、修补和该次预览显示；不包含用户选择文件或 App 冷启动。大图的完整清晰度随后在后台载入，因此 `seconds` 不代表所有全尺寸预览下载完成的时间。验证会额外等到 `fullPreviewReady` 为真才继续；`native-export.tif` 是通过真实原生保存桥接写出的副本。
 
 补画验证时，`brush.firstSeconds`、`undoSeconds`、`repeatSeconds` 分别记录每次操作到预览更新完成的耗时，`autoSeconds` 保留首次整张处理的时间。两种时间不能混作同一项性能指标。验证坐标需由调用者选择；执行成功不代表该位置一定是灰尘，也不能推算全图识别准确率。
+
+完整与局部 JPEG 预览分别编码，撤销前后的显示像素允许最多 8 级差异，并记录 `undoPreviewMaxDelta`。实际图像数据的精确撤销由引擎测试验证；原生无损导出的像素另与引擎结果核对，不能用预览的容差替代。
 
 验证模式通过与正常使用相同的原生设置桥接写入独立测试偏好域，不改变用户的设置。下次验证时省略 `--verify-preferences`，可检查重新启动和随机端口改变后是否沿用设置。
 

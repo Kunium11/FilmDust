@@ -274,7 +274,7 @@ final class FilmDustApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             guard let self = self else { return }
             if Date() > self.verificationDeadline { self.verificationFailure("Bundled page processing timed out"); return }
             let waitForBrush = self.verificationDidBrush ? " && !!window.filmDustBrushCheck" : ""
-            self.webView.evaluateJavaScript("!state.busy && state.ready && (state.lastDuration !== null || state.lastEditDuration !== null)\(waitForBrush)") { value, error in
+            self.webView.evaluateJavaScript("!state.busy && state.ready && state.fullResolution && !state.sharpening && (state.lastDuration !== null || state.lastEditDuration !== null)\(waitForBrush)") { value, error in
                 if let error = error { self.verificationFailure(error.localizedDescription); return }
                 guard (value as? Bool) == true else { return }
                 if let brush = self.verificationBrush, !self.verificationDidBrush {
@@ -289,9 +289,12 @@ final class FilmDustApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                         const after=pixel(), firstSeconds=state.lastEditDuration, patch=state.info.preview_patch;
                         await mutation('/api/undo',{},'正在撤销这一处…');
                         const undo=pixel(),undoSeconds=state.lastEditDuration;
-                        if(JSON.stringify(before)!==JSON.stringify(undo))throw Error('Undo pixels differ');
+                        // Full and cropped previews are separately JPEG-encoded.
+                        // Exact underlying pixels are checked by engine/TIFF tests.
+                        const undoPreviewMaxDelta=Math.max(...before.map((v,i)=>Math.abs(v-undo[i])));
+                        if(undoPreviewMaxDelta>8)throw Error('Undo preview differs beyond JPEG tolerance');
                         await mutation('/api/edit',{mode:'add',points:[point],diameter},'正在修补这一处…');
-                        window.filmDustBrushCheck={before,after,undo,firstSeconds,undoSeconds,repeatSeconds:state.lastEditDuration,patch,autoSeconds,changedPixels:state.info.edit.changed_pixels};
+                        window.filmDustBrushCheck={before,after,undo,undoPreviewMaxDelta,firstSeconds,undoSeconds,repeatSeconds:state.lastEditDuration,patch,autoSeconds,changedPixels:state.info.edit.changed_pixels};
                       }catch(e){window.filmDustBrushCheck={error:String(e)};}
                     })()
                     """
@@ -330,7 +333,7 @@ final class FilmDustApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         guard !verified, let directory = verificationDirectory else { return }
         verified = true
         if let data = try? JSONSerialization.data(withJSONObject: verificationRuns, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: directory.appendingPathComponent("native-runs.json")) }
-        webView.evaluateJavaScript("JSON.stringify({ready:!document.getElementById('exportBtn').disabled,summary:document.getElementById('resultSummary').textContent,width:innerWidth,height:innerHeight,nativeBridge:!!window.webkit.messageHandlers.filmExport,closeGuard:\(verifiedCloseGuard),port:location.port})") { [weak self] value, error in
+        webView.evaluateJavaScript("JSON.stringify({ready:!document.getElementById('exportBtn').disabled,fullPreviewReady:state.fullResolution&&!state.sharpening,summary:document.getElementById('resultSummary').textContent,width:innerWidth,height:innerHeight,nativeBridge:!!window.webkit.messageHandlers.filmExport,closeGuard:\(verifiedCloseGuard),port:location.port})") { [weak self] value, error in
             guard let self = self else { return }
             if let value = value as? String { try? value.write(to: directory.appendingPathComponent("native-check.json"), atomically: true, encoding: .utf8) }
             let config = WKSnapshotConfiguration()
