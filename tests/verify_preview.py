@@ -1,4 +1,5 @@
 """Lossy progressive previews. Export stays lossless and detection stays put."""
+import hashlib
 import io
 import json
 import threading
@@ -8,13 +9,17 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 import tifffile
 from PIL import Image, ImageCms
 
 import engine
 import server
-from engine import Photo, png_bytes
+from engine import (
+    Photo, _straight_structure_band, detect_dust, png_bytes, scale_kernel,
+    scale_length, scaled_dust_size,
+)
 
 
 def png(array):
@@ -187,6 +192,100 @@ class PreviewContract(unittest.TestCase):
         np.testing.assert_array_equal(photo.mask, control.mask)
         np.testing.assert_array_equal(photo.heal(), control.result)
         np.testing.assert_array_equal(photo.heal()[photo.mask == 0], cv2_speck[photo.mask == 0])
+
+    def test_scaled_preview_blocks_export_until_full_auto_matches(self):
+        """Wide scans get a scaled first compare. TIFF still matches full Auto alone."""
+        original = np.full((96, 3072, 3), 130, np.uint8)
+        cv2.circle(original, (400, 48), 3, (250, 250, 250), -1)
+        raw = png(original)
+        uploaded = self.upload(raw, "wide.png")
+        photo = server.SESSIONS[uploaded["id"]]
+        self.assertLess(photo.quick_scale, 1)
+        revision = photo.revision
+        mask = photo.mask.copy()
+        kernels = []
+        real_median = cv2.medianBlur
+
+        def spy_median(src, ksize):
+            kernels.append(int(ksize))
+            return real_median(src, ksize)
+
+        with patch("cv2.medianBlur", side_effect=spy_median):
+            status, body, _ = self.post("/api/process", {"id": uploaded["id"], "level": "auto", "stage": "preview"})
+        self.assertEqual(status, 200, body)
+        info = json.loads(body)
+        self.assertEqual(info["preview_stage"], "quick")
+        self.assertFalse(info["export_ready"])
+        self.assertEqual(info["revision"], revision)
+        np.testing.assert_array_equal(photo.mask, mask)
+        self.assertTrue(photo.quick_compare_pending_full)
+        quick = info["quick"]
+        self.assertEqual(quick["light_median"], scale_kernel(31, photo.quick_scale))
+        self.assertLess(quick["light_median"], 31)
+        self.assertEqual(quick["split_median"], scale_kernel(31, photo.quick_scale))
+        self.assertEqual(quick["scaled_size"], scaled_dust_size(30, photo.quick_scale))
+        self.assertLess(quick["scaled_size"], 30)
+        self.assertEqual(int(quick["scaled_length"]), scale_length(1000, photo.quick_scale))
+        self.assertLess(int(quick["scaled_length"]), 1000)
+        self.assertIn(quick["light_median"], kernels)
+        self.assertNotIn(31, kernels)
+        status, denied, _ = self.post("/api/export", {"id": uploaded["id"], "revision": info["revision"], "format": "tiff"})
+        self.assertEqual(status, 400)
+        self.assertIn("完整结果尚未完成", json.loads(denied)["error"])
+        preview_status, preview, mime = self.get_image(uploaded["id"], "result", info["revision"], max_edge=2048)
+        self.assertEqual(preview_status, 200)
+        self.assertEqual(mime, "image/jpeg")
+        self.assertTrue(preview.startswith(b"\xff\xd8"))
+        self.assertLessEqual(max(Image.open(io.BytesIO(preview)).size), 2048)
+        self.assertLess(max(Image.open(io.BytesIO(preview)).size), original.shape[1])
+        scales = []
+        real_detect = engine.detect_dust
+
+        def spy_detect(*args, **kwargs):
+            scales.append(kwargs.get("spatial_scale", 1))
+            return real_detect(*args, **kwargs)
+
+        with patch("engine.detect_dust", side_effect=spy_detect):
+            status, body, _ = self.post("/api/process", {"id": uploaded["id"], "level": "auto"})
+        self.assertEqual(status, 200, body)
+        full = json.loads(body)
+        self.assertEqual(scales, [1])
+        self.assertEqual(full["preview_stage"], "full")
+        self.assertTrue(full["export_ready"])
+        self.assertFalse(photo.quick_compare_pending_full)
+        self.assertGreater(full["revision"], revision)
+        self.assertEqual(self.post("/api/export", {"id": uploaded["id"], "revision": revision, "format": "tiff"})[0], 400)
+        status, exported, headers = self.post("/api/export", {"id": uploaded["id"], "revision": full["revision"], "format": "tiff"})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "image/tiff")
+        control = Photo(raw, "wide.png")
+        control.process("auto")
+        control_tiff = control.export("tiff")[0]
+        self.assertEqual(hashlib.sha256(exported).hexdigest(), hashlib.sha256(control_tiff).hexdigest())
+        np.testing.assert_array_equal(photo.mask, control.mask)
+        np.testing.assert_array_equal(photo.heal(), control.result)
+        decoded = tifffile.imread(io.BytesIO(exported))
+        np.testing.assert_array_equal(decoded[photo.mask == 0], original[photo.mask == 0])
+
+
+class ScaledPreviewThresholds(unittest.TestCase):
+    def test_scale_one_keeps_full_resolution_literals(self):
+        self.assertEqual(scale_kernel(31, 1), 31)
+        self.assertEqual(scale_kernel(21, 1), 21)
+        self.assertEqual(scale_length(1000, 1), 1000)
+        self.assertEqual(scale_length(80, 1), 80)
+        self.assertEqual(scaled_dust_size(30, 1), 30)
+        image = np.full((180, 240, 3), 110, np.uint8)
+        cv2.circle(image, (80, 70), 3, (250, 250, 250), -1)
+        np.testing.assert_array_equal(
+            detect_dust(image, 70, 30, True, True, "light"),
+            detect_dust(image, 70, 30, True, True, "light", spatial_scale=1))
+
+    def test_shorter_straight_band_is_held_only_when_length_is_scaled(self):
+        comp = np.zeros((40, 160), np.uint8)
+        cv2.line(comp, (12, 20), (72, 20), 255, 1)
+        self.assertFalse(_straight_structure_band(comp, 1))
+        self.assertTrue(_straight_structure_band(comp, 0.5))
 
 
 if __name__ == "__main__":
